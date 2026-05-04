@@ -1,3 +1,5 @@
 python-telegram-bot
 aiohttp 
 beautifulsoup4 
+cairosvg
+Pillow
