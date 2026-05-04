@@ -17,10 +17,11 @@ from telegram.ext import (
     filters,
 )
 
-# ==================== НАСТРОЙКА ЛОГИРОВАНИЯ ====================
+# ==================== НАСТРОЙКИ ====================
+DEBUG = True          # Включить отладку (вывод в чат)
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
+    level=logging.DEBUG if DEBUG else logging.INFO,
 )
 logger = logging.getLogger(__name__)
 
@@ -33,102 +34,110 @@ SUBJECTS = {
     "Русский язык": {"ege": 1, "oge": 1},
     "Физика": {"ege": 3, "oge": 3},
 }
-
 LEVELS = {"ЕГЭ": "ege", "ОГЭ": "oge"}
-
-BASE_URLS = {
-    "ege": "https://ege.sdamgia.ru",
-    "oge": "https://oge.sdamgia.ru",
-}
-
+BASE_URLS = {"ege": "https://ege.sdamgia.ru", "oge": "https://oge.sdamgia.ru"}
 user_tasks: Dict[int, Dict] = {}
 
-# ==================== ФУНКЦИИ ПАРСИНГА И ИЗОБРАЖЕНИЙ ====================
+# ==================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ====================
+async def debug_send(update: Update, text: str):
+    if DEBUG:
+        try:
+            await update.message.reply_text(f"🛠 [DEBUG] {text}")
+        except:
+            pass
+
 async def download_image(session: aiohttp.ClientSession, url: str) -> Optional[BytesIO]:
-    """Скачивает изображение и возвращает BytesIO для отправки."""
     try:
         async with session.get(url, timeout=10) as resp:
-            if resp.status == 200:
-                content_type = resp.headers.get('content-type', '')
-                if 'image' not in content_type:
-                    logger.warning(f"URL {url} не является изображением (Content-Type: {content_type})")
-                    return None
+            if resp.status == 200 and 'image' in resp.headers.get('content-type', ''):
                 data = await resp.read()
-                if len(data) > 10 * 1024 * 1024:  # телеграм ограничение 10 МБ
-                    logger.warning(f"Изображение слишком большое: {len(data)} байт")
-                    return None
-                return BytesIO(data)
-            else:
-                logger.warning(f"Не удалось загрузить {url}, статус {resp.status}")
-                return None
+                if len(data) <= 10 * 1024 * 1024:
+                    return BytesIO(data)
+            return None
     except Exception as e:
-        logger.error(f"Ошибка загрузки {url}: {e}")
+        logger.error(f"Image download error: {e}")
         return None
 
-
 def extract_image_urls(soup: BeautifulSoup, base_url: str) -> list:
-    """Извлекает абсолютные URL изображений из HTML."""
-    img_urls = []
+    urls = []
     for img in soup.find_all("img"):
         src = img.get("src")
-        if not src:
-            continue
-        if src.startswith("//"):
-            src = "https:" + src
-        elif src.startswith("/"):
-            src = base_url + src
-        img_urls.append(src)
-    return img_urls
+        if src:
+            if src.startswith("//"):
+                src = "https:" + src
+            elif src.startswith("/"):
+                src = base_url + src
+            urls.append(src)
+    return urls
 
-
-async def fetch_random_task(level: str, subject_id: int) -> Optional[Dict]:
+async def fetch_random_task(level: str, subject_id: int, update: Update) -> Optional[Dict]:
     base_url = BASE_URLS[level]
     async with aiohttp.ClientSession() as session:
-        for _ in range(20):
+        for attempt in range(20):
             task_id = random.randint(1, 500000)
             problem_url = f"{base_url}/problem?id={task_id}"
+            await debug_send(update, f"Попытка {attempt+1}: проверяю {problem_url}")
             try:
                 async with session.get(problem_url, timeout=10) as resp:
                     if resp.status == 200:
                         html = await resp.text()
-                        task_data = await parse_problem_page(html, base_url, session)
+                        # Логируем первые 500 символов HTML для отладки (не в чат)
+                        logger.debug(f"HTML snippet: {html[:500]}")
+                        task_data = await parse_problem_page(html, base_url, session, update, problem_url)
                         if task_data:
                             return task_data
+                    else:
+                        await debug_send(update, f"HTTP {resp.status} для {problem_url}")
                 await asyncio.sleep(0.5)
             except Exception as e:
-                logger.error(f"Ошибка при запросе {problem_url}: {e}")
-                continue
+                logger.error(f"Request error: {e}")
+                await debug_send(update, f"Ошибка: {e}")
     return None
 
-
-async def parse_problem_page(html: str, base_url: str, session: aiohttp.ClientSession) -> Optional[Dict]:
+async def parse_problem_page(html: str, base_url: str, session: aiohttp.ClientSession, update: Update, problem_url: str) -> Optional[Dict]:
     soup = BeautifulSoup(html, "html.parser")
 
-    # Получаем блок с условием
+    # === 1. Текст задания ===
     problem_div = soup.find("div", class_="pbody") or soup.find("div", {"id": "problem"})
     if not problem_div:
+        await debug_send(update, "Не найден div с заданием (pbody или problem)")
         return None
-
-    # Извлекаем текст, но сохраняем также альтернативный текст для картинок (если есть alt)
     task_text = problem_div.get_text(separator="\n", strip=True)
 
-    # Правильный ответ
-    answer_elem = (
-        soup.find("div", class_="answer")
-        or soup.find("div", class_="correct")
-        or soup.find("span", id="answer")
-    )
+    # === 2. Правильный ответ (улучшенный поиск) ===
+    # Ищем любой элемент, содержащий ответ – часто это div.answer, span.answer, div.correct
+    answer_elem = None
+    for selector in ["div.answer", "span.answer", "div.correct", "span.correct", ".answer", ".correct"]:
+        answer_elem = soup.select_one(selector)
+        if answer_elem:
+            break
     if not answer_elem:
+        # Иногда ответ лежит в теге <div> с текстом "Ответ: ..."
+        for div in soup.find_all("div"):
+            if div.get_text(strip=True).startswith("Ответ:"):
+                answer_elem = div
+                break
+    if not answer_elem:
+        await debug_send(update, f"Не найден ответ на странице {problem_url}")
         return None
-    correct_answer = answer_elem.get_text(strip=True)
 
-    # Изображения
+    correct_answer = answer_elem.get_text(strip=True)
+    # Убираем префикс "Ответ:" если он есть
+    if correct_answer.lower().startswith("ответ:"):
+        correct_answer = correct_answer[5:].strip()
+    # Убираем точки, лишние пробелы
+    correct_answer = correct_answer.strip().rstrip('.')
+
+    await debug_send(update, f"Найден ответ: '{correct_answer}' из элемента {answer_elem.name}.{answer_elem.get('class', '')}")
+
+    # === 3. Изображения ===
     img_urls = extract_image_urls(problem_div, base_url)
     images_io = []
     for url in img_urls:
-        img_io = await download_image(session, url)
-        if img_io:
-            images_io.append(img_io)
+        img = await download_image(session, url)
+        if img:
+            images_io.append(img)
+    await debug_send(update, f"Найдено изображений: {len(images_io)} из {len(img_urls)} URL")
 
     return {
         "text": task_text,
@@ -136,8 +145,7 @@ async def parse_problem_page(html: str, base_url: str, session: aiohttp.ClientSe
         "images": images_io,
     }
 
-
-# ==================== ОБРАБОТЧИКИ ДИАЛОГА ====================
+# ==================== ОБРАБОТЧИКИ КОМАНД ====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     reply_keyboard = [[subject] for subject in SUBJECTS.keys()]
     await update.message.reply_text(
@@ -146,13 +154,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     )
     return SUBJECT
 
-
 async def subject_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     subject = update.message.text
     if subject not in SUBJECTS:
         await update.message.reply_text("Пожалуйста, выбери предмет из списка.")
         return SUBJECT
-
     context.user_data["subject"] = subject
     reply_keyboard = [[level] for level in LEVELS.keys()]
     await update.message.reply_text(
@@ -160,7 +166,6 @@ async def subject_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         reply_markup=ReplyKeyboardMarkup(reply_keyboard, one_time_keyboard=True),
     )
     return LEVEL
-
 
 async def level_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     level_name = update.message.text
@@ -172,7 +177,10 @@ async def level_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     subject = context.user_data["subject"]
     subject_id = SUBJECTS[subject][level_code]
 
-    task = await fetch_random_task(level_code, subject_id)
+    # Отладочное сообщение
+    await debug_send(update, f"Запрашиваю задание (уровень={level_code}, subject_id={subject_id})")
+
+    task = await fetch_random_task(level_code, subject_id, update)
     if task is None:
         await update.message.reply_text(
             "Не удалось получить задание. Попробуй позже.",
@@ -186,35 +194,22 @@ async def level_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         "correct_answer": task["answer"],
     }
 
-    # Отправляем текст задания
     await update.message.reply_text(
-        f"Вот задание ({level_name}, {subject}):\n\n{task['text']}",
+        f"Вот задание ({level_name}, {subject}):\n\n{task['text']}"
     )
-
-    # Отправляем изображения (если есть)
     for idx, img_io in enumerate(task["images"]):
         try:
             img_io.seek(0)
-            await update.message.reply_photo(photo=img_io, caption=f"Часть {idx+1}" if len(task["images"])>1 else None)
+            await update.message.reply_photo(photo=img_io)
         except Exception as e:
-            logger.error(f"Ошибка отправки фото: {e}")
-            # Пробуем ещё раз с паузой
-            await asyncio.sleep(1)
-            try:
-                img_io.seek(0)
-                await update.message.reply_photo(photo=img_io)
-            except Exception as e2:
-                logger.error(f="Повторная ошибка: {e2}")
-                await update.message.reply_text("⚠️ Не удалось отправить изображение (возможно, повреждён формат).")
-
+            await debug_send(update, f"Ошибка отправки фото: {e}")
+            await update.message.reply_text("⚠️ Изображение не отправилось, но задание продолжается.")
     await update.message.reply_text("Введи свой ответ:")
     return WAITING_ANSWER
-
 
 async def check_answer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user_id = update.effective_user.id
     user_data = user_tasks.get(user_id)
-
     if not user_data:
         await update.message.reply_text("Что-то пошло не так. Начнём заново? /start")
         return ConversationHandler.END
@@ -222,17 +217,17 @@ async def check_answer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     user_answer = update.message.text.strip()
     correct_answer = user_data["correct_answer"]
 
+    # Отладочный вывод
+    await debug_send(update, f"Ответ пользователя: '{user_answer}', правильный ответ: '{correct_answer}'")
+
     if user_answer.lower() == correct_answer.lower():
         await update.message.reply_text("✅ Правильно! Молодец!\n\nХочешь решить ещё одно? /start")
     else:
         await update.message.reply_text(
-            f"❌ Неправильно.\nПравильный ответ: {correct_answer}\n\n"
-            "Попробуй ещё раз? /start"
+            f"❌ Неправильно.\nПравильный ответ: {correct_answer}\n\nПопробуй ещё раз? /start"
         )
-
     user_tasks.pop(user_id, None)
     return ConversationHandler.END
-
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.message.reply_text(
@@ -241,13 +236,11 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     )
     return ConversationHandler.END
 
-
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "Я умею присылать случайные задания с сайта Решу ЕГЭ/ОГЭ.\n"
         "Просто напиши /start и следуй инструкциям."
     )
-
 
 # ==================== ЗАПУСК ====================
 def main() -> None:
@@ -270,7 +263,6 @@ def main() -> None:
     application.add_handler(CommandHandler("help", help_command))
 
     application.run_polling(allowed_updates=Update.ALL_TYPES)
-
 
 if __name__ == "__main__":
     main()
