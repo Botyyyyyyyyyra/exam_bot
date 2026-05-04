@@ -6,7 +6,7 @@ from typing import Dict, Optional
 
 import aiohttp
 from bs4 import BeautifulSoup
-from telegram import ReplyKeyboardMarkup, ReplyKeyboardRemove, Update
+from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, InputMediaPhoto
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -27,7 +27,6 @@ logger = logging.getLogger(__name__)
 SUBJECT, LEVEL, WAITING_ANSWER = range(3)
 
 # ==================== ДАННЫЕ ПРЕДМЕТОВ И УРОВНЕЙ ====================
-# ID предметов на сайтах sdamgia.ru (примерные, могут отличаться)
 SUBJECTS = {
     "Математика": {"ege": 2, "oge": 2},
     "Русский язык": {"ege": 1, "oge": 1},
@@ -41,22 +40,43 @@ BASE_URLS = {
     "oge": "https://oge.sdamgia.ru",
 }
 
-# Хранилище заданий для пользователей (в памяти)
 user_tasks: Dict[int, Dict] = {}
 
-# ==================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ====================
+# ==================== ФУНКЦИИ ПАРСИНГА И ИЗОБРАЖЕНИЙ ====================
+async def download_image(session: aiohttp.ClientSession, url: str) -> Optional[bytes]:
+    """Скачивает изображение по URL и возвращает байты."""
+    try:
+        async with session.get(url, timeout=10) as resp:
+            if resp.status == 200:
+                return await resp.read()
+            else:
+                logger.warning(f"Не удалось загрузить изображение {url}, статус {resp.status}")
+                return None
+    except Exception as e:
+        logger.error(f"Ошибка при загрузке изображения {url}: {e}")
+        return None
+
+
+def extract_images(soup: BeautifulSoup, base_url: str) -> list:
+    """Извлекает все ссылки на изображения из условия задания."""
+    img_urls = []
+    for img in soup.find_all("img"):
+        src = img.get("src")
+        if src:
+            if src.startswith("//"):
+                src = "https:" + src
+            elif src.startswith("/"):
+                src = base_url + src
+            img_urls.append(src)
+    return img_urls
+
+
 async def fetch_random_task(level: str, subject_id: int) -> Optional[Dict]:
     """
-    Асинхронно получает случайное задание с сайта Решу ЕГЭ/ОГЭ.
-    Параметры:
-        level: 'ege' или 'oge'
-        subject_id: числовой ID предмета (не используется напрямую, но может пригодиться)
-    Возвращает:
-        Словарь с ключами 'text' и 'answer' или None при ошибке.
+    Получает случайное задание, включая текст и изображения.
     """
     base_url = BASE_URLS[level]
     async with aiohttp.ClientSession() as session:
-        # Пытаемся найти существующее задание (максимум 20 попыток)
         for _ in range(20):
             task_id = random.randint(1, 500000)
             problem_url = f"{base_url}/problem?id={task_id}"
@@ -64,7 +84,7 @@ async def fetch_random_task(level: str, subject_id: int) -> Optional[Dict]:
                 async with session.get(problem_url, timeout=10) as resp:
                     if resp.status == 200:
                         html = await resp.text()
-                        task_data = parse_problem_page(html)
+                        task_data = await parse_problem_page(html, base_url, session)
                         if task_data:
                             return task_data
                 await asyncio.sleep(0.5)
@@ -74,8 +94,10 @@ async def fetch_random_task(level: str, subject_id: int) -> Optional[Dict]:
     return None
 
 
-def parse_problem_page(html: str) -> Optional[Dict]:
-    """Извлекает текст задания и правильный ответ из HTML страницы."""
+async def parse_problem_page(html: str, base_url: str, session: aiohttp.ClientSession) -> Optional[Dict]:
+    """
+    Парсит HTML, извлекает текст задания, ответ и изображения.
+    """
     soup = BeautifulSoup(html, "html.parser")
 
     # Текст задания
@@ -94,12 +116,23 @@ def parse_problem_page(html: str) -> Optional[Dict]:
         return None
     correct_answer = answer_elem.get_text(strip=True)
 
-    return {"text": task_text, "answer": correct_answer}
+    # Изображения
+    img_urls = extract_images(problem_div, base_url)
+    images_bytes = []
+    for url in img_urls:
+        img_data = await download_image(session, url)
+        if img_data:
+            images_bytes.append(img_data)
+
+    return {
+        "text": task_text,
+        "answer": correct_answer,
+        "images": images_bytes,
+    }
 
 
 # ==================== ОБРАБОТЧИКИ КОМАНД ====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Начало диалога: выбор предмета."""
     reply_keyboard = [[subject] for subject in SUBJECTS.keys()]
     await update.message.reply_text(
         "Привет! Я помогу тебе подготовиться к ЕГЭ/ОГЭ.\nВыбери предмет:",
@@ -109,7 +142,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 
 async def subject_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Обработка выбора предмета."""
     subject = update.message.text
     if subject not in SUBJECTS:
         await update.message.reply_text("Пожалуйста, выбери предмет из списка.")
@@ -125,15 +157,14 @@ async def subject_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 async def level_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Обработка выбора уровня и получение задания."""
     level_name = update.message.text
     if level_name not in LEVELS:
         await update.message.reply_text("Пожалуйста, выбери уровень из списка.")
         return LEVEL
 
-    level_code = LEVELS[level_name]  # 'ege' или 'oge'
+    level_code = LEVELS[level_name]
     subject = context.user_data["subject"]
-    subject_id = SUBJECTS[subject][level_code]  # ID предмета (пока не используется, но оставим)
+    subject_id = SUBJECTS[subject][level_code]
 
     task = await fetch_random_task(level_code, subject_id)
     if task is None:
@@ -149,15 +180,24 @@ async def level_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         "correct_answer": task["answer"],
     }
 
+    # Отправляем текст задания
     await update.message.reply_text(
-        f"Вот задание ({level_name}, {subject}):\n\n{task['text']}\n\nВведи свой ответ:",
-        reply_markup=ReplyKeyboardRemove(),
+        f"Вот задание ({level_name}, {subject}):\n\n{task['text']}",
     )
+
+    # Отправляем изображения (если есть)
+    for img_bytes in task["images"]:
+        try:
+            await update.message.reply_photo(photo=img_bytes)
+        except Exception as e:
+            logger.error(f"Ошибка отправки изображения: {e}")
+            await update.message.reply_text("⚠️ Не удалось отправить изображение к заданию.")
+
+    await update.message.reply_text("Введи свой ответ:")
     return WAITING_ANSWER
 
 
 async def check_answer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Проверка ответа пользователя."""
     user_id = update.effective_user.id
     user_data = user_tasks.get(user_id)
 
@@ -169,9 +209,7 @@ async def check_answer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     correct_answer = user_data["correct_answer"]
 
     if user_answer.lower() == correct_answer.lower():
-        await update.message.reply_text(
-            "✅ Правильно! Молодец!\n\nХочешь решить ещё одно? /start"
-        )
+        await update.message.reply_text("✅ Правильно! Молодец!\n\nХочешь решить ещё одно? /start")
     else:
         await update.message.reply_text(
             f"❌ Неправильно.\nПравильный ответ: {correct_answer}\n\n"
@@ -183,7 +221,6 @@ async def check_answer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Отмена диалога."""
     await update.message.reply_text(
         "Диалог прерван. Чтобы начать заново, отправь /start",
         reply_markup=ReplyKeyboardRemove(),
@@ -192,24 +229,20 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Команда /help."""
     await update.message.reply_text(
         "Я умею присылать случайные задания с сайта Решу ЕГЭ/ОГЭ.\n"
         "Просто напиши /start и следуй инструкциям."
     )
 
 
-# ==================== ЗАПУСК БОТА ====================
+# ==================== ЗАПУСК ====================
 def main() -> None:
-    """Точка входа: запуск бота с polling."""
     TOKEN = os.environ.get("TELEGRAM_TOKEN")
     if not TOKEN:
         raise ValueError("Переменная окружения TELEGRAM_TOKEN не установлена!")
 
-    # Создаём приложение
     application = Application.builder().token(TOKEN).build()
 
-    # Диалог
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
@@ -222,7 +255,6 @@ def main() -> None:
     application.add_handler(conv_handler)
     application.add_handler(CommandHandler("help", help_command))
 
-    # Запуск polling
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
