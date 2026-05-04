@@ -3,7 +3,7 @@ import logging
 import os
 import random
 import re
-from typing import Dict, Optional
+from typing import Dict, Optional, List
 from io import BytesIO
 
 import aiohttp
@@ -41,26 +41,26 @@ MATH_EGE_TEST_URL = f"https://mathb-ege.sdamgia.ru/test?id={MATH_EGE_TEST_ID}"
 # Правильные ответы для ПЕРВЫХ подзаданий варианта 21621325
 CORRECT_ANSWERS = {
     1: "7",          # шоколадки
-    2: "3142",       # соответствие величин (A-3, Б-4, В-1, Г-2) – уточнить по ответам
-    3: "22",         # диаграмма температура
+    2: "3142",       # соответствие величин (A-3, Б-4, В-1, Г-2)
+    3: "22",         # диаграмма
     4: "25",         # работа постоянного тока
-    5: "0.2",        # вероятность (5/20=0.25? Уточнить, но в примере 0.2)
-    6: "236",        # экскурсии (2,3,6)
-    7: "4321",       # производная (порядок A-4, Б-3, В-2, Г-1) – уточнить
-    8: "24",         # печенье (утверждения 2 и 4)
+    5: "0.2",        # вероятность
+    6: "236",        # экскурсии
+    7: "4321",       # производная
+    8: "24",         # печенье (2 и 4)
     9: "6",          # площадь озера
-    10: "1500",      # участок минус дом
-    11: "24500",     # объём детали (70*70*5)
+    10: "1500",      # участок
+    11: "24500",     # объём детали
     12: "12",        # медиана
-    13: "270",       # конус (10*27)
-    14: "24.7",      # выражение (3.1+3.4)*3.8
-    15: "297",       # книга со скидкой
-    16: "4",         # 12^12 / (2^14 * 6^11) = 4
-    17: "5",         # корень уравнения ( (1/4)^(2-x)=64 )
-    18: "4321",      # соответствие точек и чисел (A-4, Б-3, В-2, Г-1)
-    19: "222",       # трёхзначное чётное число (например, 222)
-    20: "4",         # встреча (расстояние от точки отправления)
-    21: "6",         # верных ответов (56 очков)
+    13: "270",       # конус
+    14: "24.7",      # выражение
+    15: "297",       # книга
+    16: "4",         # выражение
+    17: "5",         # корень
+    18: "4321",      # соответствие
+    19: "222",       # трёхзначное
+    20: "4",         # встреча
+    21: "6",         # верных ответов
 }
 user_tasks: Dict[int, Dict] = {}
 
@@ -83,9 +83,29 @@ async def download_image(session: aiohttp.ClientSession, url: str) -> Optional[B
         logger.error(f"Image download error: {e}")
         return None
 
-def extract_image_urls_from_div(div, base_url: str) -> list:
+def extract_image_urls_from_div(div, base_url: str, stop_at_il: bool = True) -> List[str]:
+    """Возвращает URL изображений только до первого 'ИЛИ' если stop_at_il=True."""
     urls = []
-    for img in div.find_all("img"):
+    # Если нужно обрезать по ИЛИ, ищем позицию маркера в тексте HTML
+    if stop_at_il:
+        html = str(div)
+        # Найдём позицию <center><p><b>ИЛИ</b> или <b>ИЛИ</b>
+        il_index = -1
+        # Простое регулярное выражение
+        match = re.search(r'<center><p><b>ИЛИ</b>', html, re.IGNORECASE)
+        if not match:
+            match = re.search(r'<b>ИЛИ</b>', html)
+        if match:
+            il_index = match.start()
+        # Парсим только до этого индекса, если найден
+        if il_index > 0:
+            html = html[:il_index]
+        # Пересоздаём soup из обрезанного HTML
+        soup = BeautifulSoup(html, "html.parser")
+    else:
+        soup = div
+    
+    for img in soup.find_all("img"):
         src = img.get("src")
         if src:
             if src.startswith("//"):
@@ -96,31 +116,27 @@ def extract_image_urls_from_div(div, base_url: str) -> list:
     return urls
 
 def format_html_to_text(html_content: str) -> str:
-    """Преобразует HTML в читаемый текст, обрезая до первого 'ИЛИ'."""
+    """Преобразует HTML в текст, обрезая до первого 'ИЛИ'."""
     soup = BeautifulSoup(html_content, "html.parser")
     
-    # Находим первый элемент, содержащий "ИЛИ" (обычно <center><b>ИЛИ</b>)
-    # Если найдём, то удаляем всё, что после него.
-    # Ищем по тексту, но проще: найти тег center с b и текстом "ИЛИ"
+    # Находим первый элемент, содержащий "ИЛИ"
     or_tag = soup.find(lambda tag: tag.name in ['b', 'strong', 'center'] and 'ИЛИ' in tag.get_text())
     if or_tag:
         # Удаляем все элементы после or_tag
         for elem in or_tag.find_all_next():
             elem.decompose()
-        # Также удаляем сам or_tag
+        # Удаляем сам or_tag
         or_tag.decompose()
     
     # Заменяем <br> на \n
     for br in soup.find_all("br"):
         br.replace_with("\n")
     
-    # Параграфы
     for p in soup.find_all("p"):
         p.insert_before("\n")
         p.insert_after("\n")
         p.unwrap()
     
-    # Таблицы: преобразуем в моноширинный блок
     for table in soup.find_all("table"):
         rows = []
         for tr in table.find_all("tr"):
@@ -134,7 +150,6 @@ def format_html_to_text(html_content: str) -> str:
         table_text = "\n\t" + "\n\t".join(rows) + "\n"
         table.replace_with(table_text)
     
-    # Убираем лишние пустые строки
     text = soup.get_text()
     text = re.sub(r'\n\s*\n', '\n\n', text)
     return text.strip()
@@ -150,7 +165,6 @@ async def fetch_math_ege_task(task_number: int, update: Update) -> Optional[Dict
                 html = await resp.text()
                 soup = BeautifulSoup(html, "html.parser")
                 
-                # Ищем блок с заданием по номеру
                 prob_num_div = None
                 for div in soup.find_all("div", class_="prob_num"):
                     if div.get_text(strip=True) == str(task_number):
@@ -168,30 +182,39 @@ async def fetch_math_ege_task(task_number: int, update: Update) -> Optional[Dict
                 if not pbody:
                     return None
                 
-                # Удаляем всё, что идёт после первого "ИЛИ" (включая "ИЛИ")
+                # Формируем текст только первого подзадания
                 task_html = str(pbody)
-                # Простой способ: разбить по маркеру ИЛИ (с тегами)
+                # Находим позицию ИЛИ и обрезаем
+                or_pos = -1
                 # Ищем <center><p><b>ИЛИ</b> или просто <b>ИЛИ</b>
-                or_pattern = re.compile(r'<center><p><b>ИЛИ</b>', re.IGNORECASE)
-                match = or_pattern.search(task_html)
-                if match:
-                    task_html = task_html[:match.start()]
-                # Удаляем все теги <center><p><b>ИЛИ</b>...</center> если остались
-                task_html = re.sub(r'<center><p><b>ИЛИ</b>.*?</center>', '', task_html, flags=re.DOTALL)
-                task_html = re.sub(r'<b>ИЛИ</b>', '', task_html)
+                or_match = re.search(r'<center><p><b>ИЛИ</b>', task_html, re.IGNORECASE)
+                if not or_match:
+                    or_match = re.search(r'<b>ИЛИ</b>', task_html)
+                if or_match:
+                    or_pos = or_match.start()
+                    task_html = task_html[:or_pos]
+                    # Также удаляем возможные остатки тегов
+                    task_html = re.sub(r'<center>', '', task_html)
+                    task_html = re.sub(r'</center>', '', task_html)
                 
-                # Теперь форматируем
                 task_text = format_html_to_text(task_html)
                 
-                # Извлекаем изображения из исходного pbody (не из обрезанного)
-                img_urls = extract_image_urls_from_div(pbody, url)
+                # Извлекаем URL изображений только из первого подзадания
+                # Создаём временный soup из обрезанного HTML
+                if or_pos > 0:
+                    temp_soup = BeautifulSoup(task_html, "html.parser")
+                    img_urls = extract_image_urls_from_div(temp_soup, url, stop_at_il=False)
+                else:
+                    # Если ИЛИ не найдено, берём все изображения
+                    img_urls = extract_image_urls_from_div(pbody, url, stop_at_il=True)
+                
                 images_io = []
                 for img_url in img_urls:
                     img_data = await download_image(session, img_url)
                     if img_data:
                         images_io.append(img_data)
                 
-                await debug_send(update, f"Текст получен, изображений: {len(images_io)}")
+                await debug_send(update, f"Текст получен, изображений первого варианта: {len(images_io)}")
                 return {"text": task_text, "images": images_io}
         except Exception as e:
             logger.error(f"Error: {e}")
@@ -245,18 +268,22 @@ async def level_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             "correct_answer": correct_answer,
         }
         
-        # Отправляем текст задания
         await update.message.reply_text(
             f"📘 *Задание {task_number} (ЕГЭ, Математика)*\n\n{task['text']}",
             parse_mode="Markdown"
         )
-        # Отправляем изображения как документы (без сжатия)
-        for img_io in task["images"]:
-            try:
-                img_io.seek(0)
-                await update.message.reply_document(document=img_io, filename="image.png")
-            except Exception as e:
-                await debug_send(update, f"Не удалось отправить изображение: {e}")
+        
+        # Отправляем изображения с пояснениями, если они есть
+        if task["images"]:
+            if task_number in [4, 7, 9, 10, 11, 12, 13, 18, 20, 21]:  # примеры, где нужны пояснения
+                await update.message.reply_text("📎 *Пояснение к заданию (см. изображения ниже):*", parse_mode="Markdown")
+            for idx, img_io in enumerate(task["images"]):
+                try:
+                    img_io.seek(0)
+                    await update.message.reply_document(document=img_io, filename=f"image_{task_number}_{idx}.png")
+                except Exception as e:
+                    await debug_send(update, f"Не удалось отправить изображение: {e}")
+        
         await update.message.reply_text("✍️ Введи свой ответ (только число/набор цифр без пробелов):")
         return WAITING_ANSWER
     else:
