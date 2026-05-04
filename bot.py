@@ -3,10 +3,11 @@ import logging
 import os
 import random
 from typing import Dict, Optional
+from io import BytesIO
 
 import aiohttp
 from bs4 import BeautifulSoup
-from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, InputMediaPhoto
+from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -43,38 +44,44 @@ BASE_URLS = {
 user_tasks: Dict[int, Dict] = {}
 
 # ==================== ФУНКЦИИ ПАРСИНГА И ИЗОБРАЖЕНИЙ ====================
-async def download_image(session: aiohttp.ClientSession, url: str) -> Optional[bytes]:
-    """Скачивает изображение по URL и возвращает байты."""
+async def download_image(session: aiohttp.ClientSession, url: str) -> Optional[BytesIO]:
+    """Скачивает изображение и возвращает BytesIO для отправки."""
     try:
         async with session.get(url, timeout=10) as resp:
             if resp.status == 200:
-                return await resp.read()
+                content_type = resp.headers.get('content-type', '')
+                if 'image' not in content_type:
+                    logger.warning(f"URL {url} не является изображением (Content-Type: {content_type})")
+                    return None
+                data = await resp.read()
+                if len(data) > 10 * 1024 * 1024:  # телеграм ограничение 10 МБ
+                    logger.warning(f"Изображение слишком большое: {len(data)} байт")
+                    return None
+                return BytesIO(data)
             else:
-                logger.warning(f"Не удалось загрузить изображение {url}, статус {resp.status}")
+                logger.warning(f"Не удалось загрузить {url}, статус {resp.status}")
                 return None
     except Exception as e:
-        logger.error(f"Ошибка при загрузке изображения {url}: {e}")
+        logger.error(f"Ошибка загрузки {url}: {e}")
         return None
 
 
-def extract_images(soup: BeautifulSoup, base_url: str) -> list:
-    """Извлекает все ссылки на изображения из условия задания."""
+def extract_image_urls(soup: BeautifulSoup, base_url: str) -> list:
+    """Извлекает абсолютные URL изображений из HTML."""
     img_urls = []
     for img in soup.find_all("img"):
         src = img.get("src")
-        if src:
-            if src.startswith("//"):
-                src = "https:" + src
-            elif src.startswith("/"):
-                src = base_url + src
-            img_urls.append(src)
+        if not src:
+            continue
+        if src.startswith("//"):
+            src = "https:" + src
+        elif src.startswith("/"):
+            src = base_url + src
+        img_urls.append(src)
     return img_urls
 
 
 async def fetch_random_task(level: str, subject_id: int) -> Optional[Dict]:
-    """
-    Получает случайное задание, включая текст и изображения.
-    """
     base_url = BASE_URLS[level]
     async with aiohttp.ClientSession() as session:
         for _ in range(20):
@@ -95,15 +102,14 @@ async def fetch_random_task(level: str, subject_id: int) -> Optional[Dict]:
 
 
 async def parse_problem_page(html: str, base_url: str, session: aiohttp.ClientSession) -> Optional[Dict]:
-    """
-    Парсит HTML, извлекает текст задания, ответ и изображения.
-    """
     soup = BeautifulSoup(html, "html.parser")
 
-    # Текст задания
+    # Получаем блок с условием
     problem_div = soup.find("div", class_="pbody") or soup.find("div", {"id": "problem"})
     if not problem_div:
         return None
+
+    # Извлекаем текст, но сохраняем также альтернативный текст для картинок (если есть alt)
     task_text = problem_div.get_text(separator="\n", strip=True)
 
     # Правильный ответ
@@ -117,21 +123,21 @@ async def parse_problem_page(html: str, base_url: str, session: aiohttp.ClientSe
     correct_answer = answer_elem.get_text(strip=True)
 
     # Изображения
-    img_urls = extract_images(problem_div, base_url)
-    images_bytes = []
+    img_urls = extract_image_urls(problem_div, base_url)
+    images_io = []
     for url in img_urls:
-        img_data = await download_image(session, url)
-        if img_data:
-            images_bytes.append(img_data)
+        img_io = await download_image(session, url)
+        if img_io:
+            images_io.append(img_io)
 
     return {
         "text": task_text,
         "answer": correct_answer,
-        "images": images_bytes,
+        "images": images_io,
     }
 
 
-# ==================== ОБРАБОТЧИКИ КОМАНД ====================
+# ==================== ОБРАБОТЧИКИ ДИАЛОГА ====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     reply_keyboard = [[subject] for subject in SUBJECTS.keys()]
     await update.message.reply_text(
@@ -186,12 +192,20 @@ async def level_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     )
 
     # Отправляем изображения (если есть)
-    for img_bytes in task["images"]:
+    for idx, img_io in enumerate(task["images"]):
         try:
-            await update.message.reply_photo(photo=img_bytes)
+            img_io.seek(0)
+            await update.message.reply_photo(photo=img_io, caption=f"Часть {idx+1}" if len(task["images"])>1 else None)
         except Exception as e:
-            logger.error(f"Ошибка отправки изображения: {e}")
-            await update.message.reply_text("⚠️ Не удалось отправить изображение к заданию.")
+            logger.error(f"Ошибка отправки фото: {e}")
+            # Пробуем ещё раз с паузой
+            await asyncio.sleep(1)
+            try:
+                img_io.seek(0)
+                await update.message.reply_photo(photo=img_io)
+            except Exception as e2:
+                logger.error(f="Повторная ошибка: {e2}")
+                await update.message.reply_text("⚠️ Не удалось отправить изображение (возможно, повреждён формат).")
 
     await update.message.reply_text("Введи свой ответ:")
     return WAITING_ANSWER
