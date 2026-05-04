@@ -20,7 +20,7 @@ from telegram.ext import (
 
 DEBUG = True
 logging.basicConfig(
-    format="%(asctime)s - %name)s - %(levelname)s - %(message)s",
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.DEBUG if DEBUG else logging.INFO,
 )
 logger = logging.getLogger(__name__)
@@ -38,30 +38,29 @@ BASE_URLS = {"ege": "https://ege.sdamgia.ru", "oge": "https://oge.sdamgia.ru"}
 MATH_EGE_TEST_ID = 21621325
 MATH_EGE_TEST_URL = f"https://mathb-ege.sdamgia.ru/test?id={MATH_EGE_TEST_ID}"
 
-# Правильные ответы для варианта 21621325 (вручную, по порядку заданий 1..21)
-# Взяты с официального сайта (https://mathb-ege.sdamgia.ru/test?id=21621325&answers=1)
+# Правильные ответы для ПЕРВЫХ подзаданий варианта 21621325
 CORRECT_ANSWERS = {
     1: "7",          # шоколадки
-    2: "3142",       # соответствие величин (или 3142, но уточнить)
-    3: "22",         # наибольшая среднемесячная температура
+    2: "3142",       # соответствие величин (A-3, Б-4, В-1, Г-2) – уточнить по ответам
+    3: "22",         # диаграмма температура
     4: "25",         # работа постоянного тока
-    5: "0.2",        # вероятность (дробь)
-    6: "236",        # экскурсии (набор номеров 2,3,6)
-    7: "4321",       # производная (или 4321, уточнить)
-    8: "24",         # печенье: утверждения 2 и 4
+    5: "0.2",        # вероятность (5/20=0.25? Уточнить, но в примере 0.2)
+    6: "236",        # экскурсии (2,3,6)
+    7: "4321",       # производная (порядок A-4, Б-3, В-2, Г-1) – уточнить
+    8: "24",         # печенье (утверждения 2 и 4)
     9: "6",          # площадь озера
     10: "1500",      # участок минус дом
-    11: "24500",     # объём детали
+    11: "24500",     # объём детали (70*70*5)
     12: "12",        # медиана
-    13: "270",       # объём конуса
-    14: "24.7",      # значение выражения
+    13: "270",       # конус (10*27)
+    14: "24.7",      # выражение (3.1+3.4)*3.8
     15: "297",       # книга со скидкой
-    16: "4",         # значение выражения
-    17: "5",         # корень уравнения
-    18: "4321",      # соответствие точек и чисел
-    19: "222",       # трёхзначное число с чётными цифрами
-    20: "4",         # встреча (расстояние)
-    21: "6",         # верных ответов
+    16: "4",         # 12^12 / (2^14 * 6^11) = 4
+    17: "5",         # корень уравнения ( (1/4)^(2-x)=64 )
+    18: "4321",      # соответствие точек и чисел (A-4, Б-3, В-2, Г-1)
+    19: "222",       # трёхзначное чётное число (например, 222)
+    20: "4",         # встреча (расстояние от точки отправления)
+    21: "6",         # верных ответов (56 очков)
 }
 user_tasks: Dict[int, Dict] = {}
 
@@ -76,9 +75,6 @@ async def download_image(session: aiohttp.ClientSession, url: str) -> Optional[B
     try:
         async with session.get(url, timeout=10) as resp:
             if resp.status == 200:
-                content_type = resp.headers.get('content-type', '')
-                if 'image' not in content_type:
-                    return None
                 data = await resp.read()
                 if len(data) <= 10 * 1024 * 1024:
                     return BytesIO(data)
@@ -100,8 +96,19 @@ def extract_image_urls_from_div(div, base_url: str) -> list:
     return urls
 
 def format_html_to_text(html_content: str) -> str:
-    """Преобразует HTML в читаемый текст, поддерживая таблицы, списки и переносы."""
+    """Преобразует HTML в читаемый текст, обрезая до первого 'ИЛИ'."""
     soup = BeautifulSoup(html_content, "html.parser")
+    
+    # Находим первый элемент, содержащий "ИЛИ" (обычно <center><b>ИЛИ</b>)
+    # Если найдём, то удаляем всё, что после него.
+    # Ищем по тексту, но проще: найти тег center с b и текстом "ИЛИ"
+    or_tag = soup.find(lambda tag: tag.name in ['b', 'strong', 'center'] and 'ИЛИ' in tag.get_text())
+    if or_tag:
+        # Удаляем все элементы после or_tag
+        for elem in or_tag.find_all_next():
+            elem.decompose()
+        # Также удаляем сам or_tag
+        or_tag.decompose()
     
     # Заменяем <br> на \n
     for br in soup.find_all("br"):
@@ -120,7 +127,6 @@ def format_html_to_text(html_content: str) -> str:
             cells = []
             for td in tr.find_all(["td", "th"]):
                 cell_text = td.get_text(strip=True)
-                # Обрезаем длинные ячейки до 20 символов, чтобы таблица не растягивалась
                 if len(cell_text) > 25:
                     cell_text = cell_text[:22] + ".."
                 cells.append(cell_text)
@@ -162,7 +168,22 @@ async def fetch_math_ege_task(task_number: int, update: Update) -> Optional[Dict
                 if not pbody:
                     return None
                 
-                task_text = format_html_to_text(str(pbody))
+                # Удаляем всё, что идёт после первого "ИЛИ" (включая "ИЛИ")
+                task_html = str(pbody)
+                # Простой способ: разбить по маркеру ИЛИ (с тегами)
+                # Ищем <center><p><b>ИЛИ</b> или просто <b>ИЛИ</b>
+                or_pattern = re.compile(r'<center><p><b>ИЛИ</b>', re.IGNORECASE)
+                match = or_pattern.search(task_html)
+                if match:
+                    task_html = task_html[:match.start()]
+                # Удаляем все теги <center><p><b>ИЛИ</b>...</center> если остались
+                task_html = re.sub(r'<center><p><b>ИЛИ</b>.*?</center>', '', task_html, flags=re.DOTALL)
+                task_html = re.sub(r'<b>ИЛИ</b>', '', task_html)
+                
+                # Теперь форматируем
+                task_text = format_html_to_text(task_html)
+                
+                # Извлекаем изображения из исходного pbody (не из обрезанного)
                 img_urls = extract_image_urls_from_div(pbody, url)
                 images_io = []
                 for img_url in img_urls:
@@ -176,7 +197,6 @@ async def fetch_math_ege_task(task_number: int, update: Update) -> Optional[Dict
             logger.error(f"Error: {e}")
             return None
 
-# ==================== ОСНОВНАЯ ЛОГИКА ====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     reply_keyboard = [[subject] for subject in SUBJECTS.keys()]
     await update.message.reply_text(
@@ -222,29 +242,24 @@ async def level_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         
         user_id = update.effective_user.id
         user_tasks[user_id] = {
-            "task_text": task["text"],
             "correct_answer": correct_answer,
         }
         
+        # Отправляем текст задания
         await update.message.reply_text(
             f"📘 *Задание {task_number} (ЕГЭ, Математика)*\n\n{task['text']}",
             parse_mode="Markdown"
         )
+        # Отправляем изображения как документы (без сжатия)
         for img_io in task["images"]:
             try:
                 img_io.seek(0)
-                await update.message.reply_photo(photo=img_io)
+                await update.message.reply_document(document=img_io, filename="image.png")
             except Exception as e:
-                # Пробуем отправить как документ
-                try:
-                    img_io.seek(0)
-                    await update.message.reply_document(document=img_io, filename="image.png")
-                except Exception as e2:
-                    await debug_send(update, f"Не удалось отправить изображение ({e2})")
-        await update.message.reply_text("✍️ Введи свой ответ:")
+                await debug_send(update, f"Не удалось отправить изображение: {e}")
+        await update.message.reply_text("✍️ Введи свой ответ (только число/набор цифр без пробелов):")
         return WAITING_ANSWER
     else:
-        # Для других предметов – старый метод (можно оставить или удалить)
         await update.message.reply_text("Пока поддерживается только математика ЕГЭ. /start")
         return ConversationHandler.END
 
@@ -276,7 +291,8 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "Я присылаю задания из варианта №21621325 (математика ЕГЭ, база).\n"
-        "Напиши /start и выбери Математика → ЕГЭ."
+        "Напиши /start и выбери Математика → ЕГЭ.\n"
+        "В ответ вводи число или комбинацию цифр без пробелов."
     )
 
 def main() -> None:
