@@ -18,7 +18,7 @@ from telegram.ext import (
 )
 
 # ==================== НАСТРОЙКИ ====================
-DEBUG = True          # Включить отладку (вывод в чат)
+DEBUG = True   # пока оставим, потом выключим
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.DEBUG if DEBUG else logging.INFO,
@@ -35,7 +35,16 @@ SUBJECTS = {
     "Физика": {"ege": 3, "oge": 3},
 }
 LEVELS = {"ЕГЭ": "ege", "ОГЭ": "oge"}
-BASE_URLS = {"ege": "https://ege.sdamgia.ru", "oge": "https://oge.sdamgia.ru"}
+BASE_URLS = {
+    "ege": "https://ege.sdamgia.ru",
+    "oge": "https://oge.sdamgia.ru",
+}
+
+# Специально для математики ЕГЭ: фиксированный вариант
+MATH_EGE_TEST_ID = 21621325
+MATH_EGE_ANSWER_URL = f"https://mathb-ege.sdamgia.ru/test?id={MATH_EGE_TEST_ID}&answers=1"
+MATH_EGE_TASK_URL_TEMPLATE = "https://mathb-ege.sdamgia.ru/test?id={}&task_id={}"
+
 user_tasks: Dict[int, Dict] = {}
 
 # ==================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ====================
@@ -70,82 +79,86 @@ def extract_image_urls(soup: BeautifulSoup, base_url: str) -> list:
             urls.append(src)
     return urls
 
-async def fetch_random_task(level: str, subject_id: int, update: Update) -> Optional[Dict]:
-    base_url = BASE_URLS[level]
+# ==================== ПАРСИНГ ЗАДАНИЯ ИЗ ФИКСИРОВАННОГО ВАРИАНТА ====================
+async def fetch_math_ege_task(task_number: int, update: Update) -> Optional[Dict]:
+    """Получает задание номер task_number из варианта MATH_EGE_TEST_ID"""
+    url = MATH_EGE_TASK_URL_TEMPLATE.format(MATH_EGE_TEST_ID, task_number)
+    await debug_send(update, f"Загружаем задание {task_number}: {url}")
     async with aiohttp.ClientSession() as session:
-        for attempt in range(20):
-            task_id = random.randint(1, 500000)
-            problem_url = f"{base_url}/problem?id={task_id}"
-            await debug_send(update, f"Попытка {attempt+1}: проверяю {problem_url}")
-            try:
-                async with session.get(problem_url, timeout=10) as resp:
-                    if resp.status == 200:
-                        html = await resp.text()
-                        # Логируем первые 500 символов HTML для отладки (не в чат)
-                        logger.debug(f"HTML snippet: {html[:500]}")
-                        task_data = await parse_problem_page(html, base_url, session, update, problem_url)
-                        if task_data:
-                            return task_data
-                    else:
-                        await debug_send(update, f"HTTP {resp.status} для {problem_url}")
-                await asyncio.sleep(0.5)
-            except Exception as e:
-                logger.error(f"Request error: {e}")
-                await debug_send(update, f"Ошибка: {e}")
-    return None
+        try:
+            async with session.get(url, timeout=15) as resp:
+                if resp.status != 200:
+                    await debug_send(update, f"Ошибка HTTP {resp.status}")
+                    return None
+                html = await resp.text()
+                soup = BeautifulSoup(html, "html.parser")
+                # Ищем блок с заданием. На странице test?task_id=N основное задание находится в div с class="problem" или "pbody"
+                problem_div = soup.find("div", class_="problem") or soup.find("div", class_="pbody")
+                if not problem_div:
+                    await debug_send(update, "Не найден блок задания")
+                    return None
+                # Текст
+                task_text = problem_div.get_text(separator="\n", strip=True)
+                # Изображения
+                img_urls = extract_image_urls(problem_div, url)
+                images_io = []
+                for img_url in img_urls:
+                    img_data = await download_image(session, img_url)
+                    if img_data:
+                        images_io.append(img_data)
+                await debug_send(update, f"Текст задания получен, изображений:{len(images_io)}")
+                return {"text": task_text, "images": images_io}
+        except Exception as e:
+            logger.error(f"Ошибка при получении задания {task_number}: {e}")
+            return None
 
-async def parse_problem_page(html: str, base_url: str, session: aiohttp.ClientSession, update: Update, problem_url: str) -> Optional[Dict]:
-    soup = BeautifulSoup(html, "html.parser")
+async def fetch_math_ege_answer(task_number: int, update: Update) -> Optional[str]:
+    """Парсит страницу с ответами варианта, извлекает ответ для задания task_number"""
+    async with aiohttp.ClientSession() as session:
+        try:
+            async with session.get(MATH_EGE_ANSWER_URL, timeout=15) as resp:
+                if resp.status != 200:
+                    await debug_send(update, f"Не удалось получить ответы, статус {resp.status}")
+                    return None
+                html = await resp.text()
+                soup = BeautifulSoup(html, "html.parser")
+                # Ищем элементы, содержащие ответы. Обычно это div.answer, либо td с ответами.
+                # На странице ответов задания нумерованы. Ищем по номеру.
+                # Способ: найти все блоки с номером задания, затем рядом ответ.
+                # Проще: найти элемент, содержащий текст "Задание № X" и взять следующий блок с ответом.
+                tasks = soup.find_all("div", class_="problem")
+                if not tasks:
+                    # Альтернативный поиск
+                    await debug_send(update, "Не найден список заданий на странице ответов")
+                    return None
+                # Обычно на странице answers=1 задания идут по порядку, но с разметкой.
+                # Попробуем найти все просмотром: ищем теги с текстом "Ответ:".
+                # В реальности на странице есть строка "Ответ:" и ниже число.
+                # Можно найти все элементы, содержащие "Ответ:" и взять следующий за ним span/div.
+                for elem in soup.find_all(text=lambda t: t and "Ответ:" in t):
+                    parent = elem.find_parent("div", class_="answer") or elem.find_parent("td")
+                    if parent:
+                        answer_text = parent.get_text(strip=True).replace("Ответ:", "").strip()
+                        if answer_text:
+                            # Проверяем, что ответ похож на число/слово
+                            await debug_send(update, f"Найден ответ: {answer_text}")
+                            return answer_text
+                # Если не нашли, попробуем достать ответ из таблицы ответов (иногда они в div с class="answers")
+                answers_div = soup.find("div", class_="answers")
+                if answers_div:
+                    # Нужно сопоставить номеру задания – просто берём по индексу
+                    all_answers = answers_div.find_all("div", class_="answer")
+                    if 1 <= task_number <= len(all_answers):
+                        ans = all_answers[task_number-1].get_text(strip=True)
+                        await debug_send(update, f"Ответ из таблицы: {ans}")
+                        return ans
+                await debug_send(update, "Не удалось извлечь ответ со страницы")
+                return None
+        except Exception as e:
+            logger.error(f"Ошибка получения ответа: {e}")
+            return None
 
-    # === 1. Текст задания ===
-    problem_div = soup.find("div", class_="pbody") or soup.find("div", {"id": "problem"})
-    if not problem_div:
-        await debug_send(update, "Не найден div с заданием (pbody или problem)")
-        return None
-    task_text = problem_div.get_text(separator="\n", strip=True)
-
-    # === 2. Правильный ответ (улучшенный поиск) ===
-    # Ищем любой элемент, содержащий ответ – часто это div.answer, span.answer, div.correct
-    answer_elem = None
-    for selector in ["div.answer", "span.answer", "div.correct", "span.correct", ".answer", ".correct"]:
-        answer_elem = soup.select_one(selector)
-        if answer_elem:
-            break
-    if not answer_elem:
-        # Иногда ответ лежит в теге <div> с текстом "Ответ: ..."
-        for div in soup.find_all("div"):
-            if div.get_text(strip=True).startswith("Ответ:"):
-                answer_elem = div
-                break
-    if not answer_elem:
-        await debug_send(update, f"Не найден ответ на странице {problem_url}")
-        return None
-
-    correct_answer = answer_elem.get_text(strip=True)
-    # Убираем префикс "Ответ:" если он есть
-    if correct_answer.lower().startswith("ответ:"):
-        correct_answer = correct_answer[5:].strip()
-    # Убираем точки, лишние пробелы
-    correct_answer = correct_answer.strip().rstrip('.')
-
-    await debug_send(update, f"Найден ответ: '{correct_answer}' из элемента {answer_elem.name}.{answer_elem.get('class', '')}")
-
-    # === 3. Изображения ===
-    img_urls = extract_image_urls(problem_div, base_url)
-    images_io = []
-    for url in img_urls:
-        img = await download_image(session, url)
-        if img:
-            images_io.append(img)
-    await debug_send(update, f"Найдено изображений: {len(images_io)} из {len(img_urls)} URL")
-
-    return {
-        "text": task_text,
-        "answer": correct_answer,
-        "images": images_io,
-    }
-
-# ==================== ОБРАБОТЧИКИ КОМАНД ====================
+# ==================== ОБРАБОТЧИКИ ДИАЛОГА ====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     reply_keyboard = [[subject] for subject in SUBJECTS.keys()]
     await update.message.reply_text(
@@ -172,40 +185,105 @@ async def level_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if level_name not in LEVELS:
         await update.message.reply_text("Пожалуйста, выбери уровень из списка.")
         return LEVEL
-
+    subject = context.user_data.get("subject")
     level_code = LEVELS[level_name]
-    subject = context.user_data["subject"]
-    subject_id = SUBJECTS[subject][level_code]
 
-    # Отладочное сообщение
-    await debug_send(update, f"Запрашиваю задание (уровень={level_code}, subject_id={subject_id})")
+    # Если предмет математика и уровень ЕГЭ – используем специальный вариант
+    if subject == "Математика" and level_code == "ege":
+        # Выбираем случайный номер задания от 1 до 21
+        task_number = random.randint(1, 21)
+        await debug_send(update, f"Выбрано задание №{task_number} из варианта {MATH_EGE_TEST_ID}")
 
-    task = await fetch_random_task(level_code, subject_id, update)
-    if task is None:
+        # Получаем условие и ответ
+        task = await fetch_math_ege_task(task_number, update)
+        if not task:
+            await update.message.reply_text("Не удалось загрузить задание. Попробуйте позже.")
+            return ConversationHandler.END
+
+        answer = await fetch_math_ege_answer(task_number, update)
+        if not answer:
+            await update.message.reply_text("Не удалось получить правильный ответ для проверки. Попробуйте другое задание /start")
+            return ConversationHandler.END
+
+        # Сохраняем в память
+        user_id = update.effective_user.id
+        user_tasks[user_id] = {
+            "task_text": task["text"],
+            "correct_answer": answer,
+        }
+
+        # Отправляем текст задания
         await update.message.reply_text(
-            "Не удалось получить задание. Попробуй позже.",
-            reply_markup=ReplyKeyboardRemove(),
+            f"Вот задание (ЕГЭ, Математика, вариант {MATH_EGE_TEST_ID}, задание {task_number}):\n\n{task['text']}"
         )
-        return ConversationHandler.END
+        # Отправляем изображения
+        for img_io in task["images"]:
+            try:
+                img_io.seek(0)
+                await update.message.reply_photo(photo=img_io)
+            except Exception as e:
+                await debug_send(update, f"Ошибка отправки картинки: {e}")
+        await update.message.reply_text("Введи свой ответ:")
+        return WAITING_ANSWER
 
-    user_id = update.effective_user.id
-    user_tasks[user_id] = {
-        "task_text": task["text"],
-        "correct_answer": task["answer"],
-    }
+    else:
+        # Старый метод для других предметов/уровней (случайный перебор problem?id)
+        subject_id = SUBJECTS[subject][level_code]
+        task = await fetch_random_task_old(level_code, subject_id, update)
+        if task is None:
+            await update.message.reply_text(
+                "Не удалось получить задание. Попробуй позже.",
+                reply_markup=ReplyKeyboardRemove(),
+            )
+            return ConversationHandler.END
+        user_id = update.effective_user.id
+        user_tasks[user_id] = {
+            "task_text": task["text"],
+            "correct_answer": task["answer"],
+        }
+        await update.message.reply_text(f"Вот задание ({level_name}, {subject}):\n\n{task['text']}")
+        for img_io in task.get("images", []):
+            try:
+                img_io.seek(0)
+                await update.message.reply_photo(photo=img_io)
+            except:
+                pass
+        await update.message.reply_text("Введи свой ответ:")
+        return WAITING_ANSWER
 
-    await update.message.reply_text(
-        f"Вот задание ({level_name}, {subject}):\n\n{task['text']}"
-    )
-    for idx, img_io in enumerate(task["images"]):
-        try:
-            img_io.seek(0)
-            await update.message.reply_photo(photo=img_io)
-        except Exception as e:
-            await debug_send(update, f"Ошибка отправки фото: {e}")
-            await update.message.reply_text("⚠️ Изображение не отправилось, но задание продолжается.")
-    await update.message.reply_text("Введи свой ответ:")
-    return WAITING_ANSWER
+async def fetch_random_task_old(level: str, subject_id: int, update: Update) -> Optional[Dict]:
+    """Старый метод (для других предметов)"""
+    base_url = BASE_URLS[level]
+    async with aiohttp.ClientSession() as session:
+        for _ in range(20):
+            task_id = random.randint(1, 500000)
+            problem_url = f"{base_url}/problem?id={task_id}"
+            await debug_send(update, f"Попытка {_+1}: {problem_url}")
+            try:
+                async with session.get(problem_url, timeout=10) as resp:
+                    if resp.status == 200:
+                        html = await resp.text()
+                        soup = BeautifulSoup(html, "html.parser")
+                        problem_div = soup.find("div", class_="pbody") or soup.find("div", {"id": "problem"})
+                        if not problem_div:
+                            continue
+                        task_text = problem_div.get_text(separator="\n", strip=True)
+                        answer_elem = soup.find("div", class_="answer") or soup.find("div", class_="correct") or soup.find("span", id="answer")
+                        if not answer_elem:
+                            continue
+                        correct_answer = answer_elem.get_text(strip=True)
+                        # Изображения
+                        img_urls = extract_image_urls(problem_div, base_url)
+                        images_io = []
+                        for url in img_urls:
+                            img = await download_image(session, url)
+                            if img:
+                                images_io.append(img)
+                        return {"text": task_text, "answer": correct_answer, "images": images_io}
+                await asyncio.sleep(0.5)
+            except Exception as e:
+                logger.error(e)
+    return None
 
 async def check_answer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user_id = update.effective_user.id
@@ -216,16 +294,11 @@ async def check_answer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 
     user_answer = update.message.text.strip()
     correct_answer = user_data["correct_answer"]
-
-    # Отладочный вывод
-    await debug_send(update, f"Ответ пользователя: '{user_answer}', правильный ответ: '{correct_answer}'")
-
+    await debug_send(update, f"Пользователь: '{user_answer}', Правильный: '{correct_answer}'")
     if user_answer.lower() == correct_answer.lower():
         await update.message.reply_text("✅ Правильно! Молодец!\n\nХочешь решить ещё одно? /start")
     else:
-        await update.message.reply_text(
-            f"❌ Неправильно.\nПравильный ответ: {correct_answer}\n\nПопробуй ещё раз? /start"
-        )
+        await update.message.reply_text(f"❌ Неправильно.\nПравильный ответ: {correct_answer}\n\nПопробуй ещё раз? /start")
     user_tasks.pop(user_id, None)
     return ConversationHandler.END
 
@@ -239,6 +312,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "Я умею присылать случайные задания с сайта Решу ЕГЭ/ОГЭ.\n"
+        "Для математики ЕГЭ используется фиксированный вариант с ответами.\n"
         "Просто напиши /start и следуй инструкциям."
     )
 
