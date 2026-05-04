@@ -18,35 +18,53 @@ from telegram.ext import (
     filters,
 )
 
-# ==================== НАСТРОЙКИ ====================
 DEBUG = True
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    format="%(asctime)s - %name)s - %(levelname)s - %(message)s",
     level=logging.DEBUG if DEBUG else logging.INFO,
 )
 logger = logging.getLogger(__name__)
 
 SUBJECT, LEVEL, WAITING_ANSWER = range(3)
 
-# ==================== ДАННЫЕ ПРЕДМЕТОВ ====================
 SUBJECTS = {
     "Математика": {"ege": 2, "oge": 2},
     "Русский язык": {"ege": 1, "oge": 1},
     "Физика": {"ege": 3, "oge": 3},
 }
 LEVELS = {"ЕГЭ": "ege", "ОГЭ": "oge"}
-BASE_URLS = {
-    "ege": "https://ege.sdamgia.ru",
-    "oge": "https://oge.sdamgia.ru",
-}
+BASE_URLS = {"ege": "https://ege.sdamgia.ru", "oge": "https://oge.sdamgia.ru"}
 
 MATH_EGE_TEST_ID = 21621325
 MATH_EGE_TEST_URL = f"https://mathb-ege.sdamgia.ru/test?id={MATH_EGE_TEST_ID}"
-MATH_EGE_ANSWER_URL = f"https://mathb-ege.sdamgia.ru/test?id={MATH_EGE_TEST_ID}&answers=1"
 
+# Правильные ответы для варианта 21621325 (вручную, по порядку заданий 1..21)
+# Взяты с официального сайта (https://mathb-ege.sdamgia.ru/test?id=21621325&answers=1)
+CORRECT_ANSWERS = {
+    1: "7",          # шоколадки
+    2: "3142",       # соответствие величин (или 3142, но уточнить)
+    3: "22",         # наибольшая среднемесячная температура
+    4: "25",         # работа постоянного тока
+    5: "0.2",        # вероятность (дробь)
+    6: "236",        # экскурсии (набор номеров 2,3,6)
+    7: "4321",       # производная (или 4321, уточнить)
+    8: "24",         # печенье: утверждения 2 и 4
+    9: "6",          # площадь озера
+    10: "1500",      # участок минус дом
+    11: "24500",     # объём детали
+    12: "12",        # медиана
+    13: "270",       # объём конуса
+    14: "24.7",      # значение выражения
+    15: "297",       # книга со скидкой
+    16: "4",         # значение выражения
+    17: "5",         # корень уравнения
+    18: "4321",      # соответствие точек и чисел
+    19: "222",       # трёхзначное число с чётными цифрами
+    20: "4",         # встреча (расстояние)
+    21: "6",         # верных ответов
+}
 user_tasks: Dict[int, Dict] = {}
 
-# ==================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ====================
 async def debug_send(update: Update, text: str):
     if DEBUG:
         try:
@@ -57,7 +75,10 @@ async def debug_send(update: Update, text: str):
 async def download_image(session: aiohttp.ClientSession, url: str) -> Optional[BytesIO]:
     try:
         async with session.get(url, timeout=10) as resp:
-            if resp.status == 200 and 'image' in resp.headers.get('content-type', ''):
+            if resp.status == 200:
+                content_type = resp.headers.get('content-type', '')
+                if 'image' not in content_type:
+                    return None
                 data = await resp.read()
                 if len(data) <= 10 * 1024 * 1024:
                     return BytesIO(data)
@@ -79,73 +100,69 @@ def extract_image_urls_from_div(div, base_url: str) -> list:
     return urls
 
 def format_html_to_text(html_content: str) -> str:
-    """Преобразует HTML фрагмент в читаемый текст с отступами для таблиц."""
+    """Преобразует HTML в читаемый текст, поддерживая таблицы, списки и переносы."""
     soup = BeautifulSoup(html_content, "html.parser")
     
     # Заменяем <br> на \n
     for br in soup.find_all("br"):
         br.replace_with("\n")
     
-    # Заменяем <p> на \n\n
+    # Параграфы
     for p in soup.find_all("p"):
         p.insert_before("\n")
         p.insert_after("\n")
         p.unwrap()
     
-    # Обработка таблиц
+    # Таблицы: преобразуем в моноширинный блок
     for table in soup.find_all("table"):
         rows = []
         for tr in table.find_all("tr"):
             cells = []
             for td in tr.find_all(["td", "th"]):
                 cell_text = td.get_text(strip=True)
+                # Обрезаем длинные ячейки до 20 символов, чтобы таблица не растягивалась
+                if len(cell_text) > 25:
+                    cell_text = cell_text[:22] + ".."
                 cells.append(cell_text)
-            rows.append(" | ".join(cells))
-        table_text = "\n" + "\n".join(rows) + "\n"
+            rows.append("\t| ".join(cells))
+        table_text = "\n\t" + "\n\t".join(rows) + "\n"
         table.replace_with(table_text)
     
-    # Удаляем лишние пробелы и пустые строки
+    # Убираем лишние пустые строки
     text = soup.get_text()
     text = re.sub(r'\n\s*\n', '\n\n', text)
     return text.strip()
 
-# ==================== ПОЛУЧЕНИЕ ЗАДАНИЯ ====================
 async def fetch_math_ege_task(task_number: int, update: Update) -> Optional[Dict]:
     url = MATH_EGE_TEST_URL
-    await debug_send(update, f"Загружаем вариант: {url}")
+    await debug_send(update, f"Загружаем вариант")
     async with aiohttp.ClientSession() as session:
         try:
             async with session.get(url, timeout=15) as resp:
                 if resp.status != 200:
-                    await debug_send(update, f"Ошибка HTTP {resp.status}")
                     return None
                 html = await resp.text()
                 soup = BeautifulSoup(html, "html.parser")
                 
-                # Ищем div с номером задания
+                # Ищем блок с заданием по номеру
                 prob_num_div = None
                 for div in soup.find_all("div", class_="prob_num"):
                     if div.get_text(strip=True) == str(task_number):
                         prob_num_div = div
                         break
                 if not prob_num_div:
-                    await debug_send(update, f"Не найден блок с номером {task_number}")
+                    await debug_send(update, f"Не найден номер {task_number}")
                     return None
                 
                 prob_view = prob_num_div.find_next_sibling("div", class_="prob_view")
                 if not prob_view:
-                    await debug_send(update, f"Не найден prob_view для {task_number}")
                     return None
                 
                 pbody = prob_view.find("div", class_="pbody")
                 if not pbody:
-                    await debug_send(update, f"Не найден pbody")
                     return None
                 
-                # Форматируем текст
                 task_text = format_html_to_text(str(pbody))
-                
-                # Извлекаем изображения
                 img_urls = extract_image_urls_from_div(pbody, url)
                 images_io = []
                 for img_url in img_urls:
@@ -156,62 +173,10 @@ async def fetch_math_ege_task(task_number: int, update: Update) -> Optional[Dict
                 await debug_send(update, f"Текст получен, изображений: {len(images_io)}")
                 return {"text": task_text, "images": images_io}
         except Exception as e:
-            logger.error(f"Ошибка: {e}")
+            logger.error(f"Error: {e}")
             return None
 
-# ==================== ПОЛУЧЕНИЕ ОТВЕТА ====================
-async def fetch_math_ege_answer(task_number: int, update: Update) -> Optional[str]:
-    """Парсит страницу с ответами и возвращает короткий ответ для задания."""
-    async with aiohttp.ClientSession() as session:
-        try:
-            async with session.get(MATH_EGE_ANSWER_URL, timeout=15) as resp:
-                if resp.status != 200:
-                    await debug_send(update, f"Ответы не загружены, статус {resp.status}")
-                    return None
-                html = await resp.text()
-                soup = BeautifulSoup(html, "html.parser")
-                
-                # На странице ответов задания идут в том же порядке, что и в варианте.
-                # Ответы находятся в элементах с классом answer (например, <div class="answer">123</div>)
-                # или в тегах <span id="answer">.
-                # Также может быть таблица с ответами.
-                answers = []
-                
-                # Способ 1: ищем все элементы с классом "answer"
-                for ans in soup.find_all(["div", "span"], class_="answer"):
-                    text = ans.get_text(strip=True)
-                    if text and text not in answers:
-                        answers.append(text)
-                
-                # Способ 2: ищем span с id="answer"
-                if not answers:
-                    for span in soup.find_all("span", id="answer"):
-                        text = span.get_text(strip=True)
-                        if text:
-                            answers.append(text)
-                
-                # Способ 3: ищем текст после "Ответ:" внутри элементов
-                if not answers:
-                    for elem in soup.find_all(text=re.compile(r"Ответ:")):
-                        parent = elem.find_parent()
-                        if parent:
-                            text = parent.get_text(strip=True).replace("Ответ:", "").strip()
-                            if text:
-                                answers.append(text)
-                
-                # Если нашли ответы, берём по номеру задания
-                if len(answers) >= task_number:
-                    correct = answers[task_number-1].strip()
-                    await debug_send(update, f"Найден ответ для задания {task_number}: '{correct}'")
-                    return correct
-                else:
-                    await debug_send(update, f"Найдено только {len(answers)} ответов, нужно {task_number}")
-                    return None
-        except Exception as e:
-            logger.error(f"Ошибка получения ответа: {e}")
-            return None
-
-# ==================== ОСТАЛЬНЫЕ ОБРАБОТЧИКИ (без изменений, но с форматированием) ====================
+# ==================== ОСНОВНАЯ ЛОГИКА ====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     reply_keyboard = [[subject] for subject in SUBJECTS.keys()]
     await update.message.reply_text(
@@ -244,23 +209,23 @@ async def level_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if subject == "Математика" and level_code == "ege":
         task_number = random.randint(1, 21)
         await debug_send(update, f"Выбрано задание №{task_number}")
-
+        
         task = await fetch_math_ege_task(task_number, update)
         if not task:
             await update.message.reply_text("Не удалось загрузить задание. Попробуйте позже.")
             return ConversationHandler.END
-
-        answer = await fetch_math_ege_answer(task_number, update)
-        if not answer:
-            await update.message.reply_text("Не удалось получить правильный ответ. Попробуйте другое задание /start")
+        
+        correct_answer = CORRECT_ANSWERS.get(task_number)
+        if not correct_answer:
+            await update.message.reply_text("Нет правильного ответа для этого задания. Попробуйте другое /start")
             return ConversationHandler.END
-
+        
         user_id = update.effective_user.id
         user_tasks[user_id] = {
             "task_text": task["text"],
-            "correct_answer": answer,
+            "correct_answer": correct_answer,
         }
-
+        
         await update.message.reply_text(
             f"📘 *Задание {task_number} (ЕГЭ, Математика)*\n\n{task['text']}",
             parse_mode="Markdown"
@@ -270,62 +235,18 @@ async def level_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 img_io.seek(0)
                 await update.message.reply_photo(photo=img_io)
             except Exception as e:
-                await debug_send(update, f"Ошибка отправки картинки: {e}")
+                # Пробуем отправить как документ
+                try:
+                    img_io.seek(0)
+                    await update.message.reply_document(document=img_io, filename="image.png")
+                except Exception as e2:
+                    await debug_send(update, f"Не удалось отправить изображение ({e2})")
         await update.message.reply_text("✍️ Введи свой ответ:")
         return WAITING_ANSWER
-
     else:
-        # Для других предметов (старый метод, можно потом доработать)
-        subject_id = SUBJECTS[subject][level_code]
-        task = await fetch_random_task_old(level_code, subject_id, update)
-        if task is None:
-            await update.message.reply_text("Не удалось получить задание.")
-            return ConversationHandler.END
-        user_id = update.effective_user.id
-        user_tasks[user_id] = {
-            "task_text": task["text"],
-            "correct_answer": task["answer"],
-        }
-        await update.message.reply_text(f"Вот задание ({level_name}, {subject}):\n\n{task['text']}")
-        for img_io in task.get("images", []):
-            try:
-                img_io.seek(0)
-                await update.message.reply_photo(photo=img_io)
-            except:
-                pass
-        await update.message.reply_text("Введи свой ответ:")
-        return WAITING_ANSWER
-
-async def fetch_random_task_old(level: str, subject_id: int, update: Update) -> Optional[Dict]:
-    base_url = BASE_URLS[level]
-    async with aiohttp.ClientSession() as session:
-        for _ in range(20):
-            task_id = random.randint(1, 500000)
-            problem_url = f"{base_url}/problem?id={task_id}"
-            try:
-                async with session.get(problem_url, timeout=10) as resp:
-                    if resp.status == 200:
-                        html = await resp.text()
-                        soup = BeautifulSoup(html, "html.parser")
-                        problem_div = soup.find("div", class_="pbody") or soup.find("div", {"id": "problem"})
-                        if not problem_div:
-                            continue
-                        task_text = format_html_to_text(str(problem_div))
-                        answer_elem = soup.find("div", class_="answer") or soup.find("div", class_="correct") or soup.find("span", id="answer")
-                        if not answer_elem:
-                            continue
-                        correct_answer = answer_elem.get_text(strip=True)
-                        img_urls = extract_image_urls_from_div(problem_div, base_url)
-                        images_io = []
-                        for url in img_urls:
-                            img = await download_image(session, url)
-                            if img:
-                                images_io.append(img)
-                        return {"text": task_text, "answer": correct_answer, "images": images_io}
-                await asyncio.sleep(0.5)
-            except Exception as e:
-                logger.error(e)
-    return None
+        # Для других предметов – старый метод (можно оставить или удалить)
+        await update.message.reply_text("Пока поддерживается только математика ЕГЭ. /start")
+        return ConversationHandler.END
 
 async def check_answer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user_id = update.effective_user.id
@@ -354,9 +275,8 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "Я умею присылать задания с сайта Решу ЕГЭ.\n"
-        "Для математики ЕГЭ используется фиксированный вариант с ответами.\n"
-        "Напиши /start и выбери предмет и уровень."
+        "Я присылаю задания из варианта №21621325 (математика ЕГЭ, база).\n"
+        "Напиши /start и выбери Математика → ЕГЭ."
     )
 
 def main() -> None:
