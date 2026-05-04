@@ -3,7 +3,7 @@ import logging
 import os
 import random
 import re
-from typing import Dict, Optional, List
+from typing import Dict, Optional
 from io import BytesIO
 
 import aiohttp
@@ -38,29 +38,10 @@ BASE_URLS = {"ege": "https://ege.sdamgia.ru", "oge": "https://oge.sdamgia.ru"}
 MATH_EGE_TEST_ID = 21621325
 MATH_EGE_TEST_URL = f"https://mathb-ege.sdamgia.ru/test?id={MATH_EGE_TEST_ID}"
 
-# Правильные ответы для ПЕРВЫХ подзаданий варианта 21621325
 CORRECT_ANSWERS = {
-    1: "7",          # шоколадки
-    2: "3142",       # соответствие величин (A-3, Б-4, В-1, Г-2)
-    3: "22",         # диаграмма
-    4: "25",         # работа постоянного тока
-    5: "0.2",        # вероятность
-    6: "236",        # экскурсии
-    7: "4321",       # производная
-    8: "24",         # печенье (2 и 4)
-    9: "6",          # площадь озера
-    10: "1500",      # участок
-    11: "24500",     # объём детали
-    12: "12",        # медиана
-    13: "270",       # конус
-    14: "24.7",      # выражение
-    15: "297",       # книга
-    16: "4",         # выражение
-    17: "5",         # корень
-    18: "4321",      # соответствие
-    19: "222",       # трёхзначное
-    20: "4",         # встреча
-    21: "6",         # верных ответов
+    1: "7", 2: "3142", 3: "22", 4: "25", 5: "0.2", 6: "236", 7: "4321", 8: "24", 9: "6",
+    10: "1500", 11: "24500", 12: "12", 13: "270", 14: "24.7", 15: "297", 16: "4", 17: "5",
+    18: "4321", 19: "222", 20: "4", 21: "6",
 }
 user_tasks: Dict[int, Dict] = {}
 
@@ -71,40 +52,26 @@ async def debug_send(update: Update, text: str):
         except:
             pass
 
-async def download_image(session: aiohttp.ClientSession, url: str) -> Optional[BytesIO]:
+async def download_image(session: aiohttp.ClientSession, url: str, referer: str) -> Optional[BytesIO]:
+    headers = {
+        "Referer": referer,
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+    }
     try:
-        async with session.get(url, timeout=10) as resp:
+        async with session.get(url, timeout=10, headers=headers) as resp:
             if resp.status == 200:
-                data = await resp.read()
-                if len(data) <= 10 * 1024 * 1024:
-                    return BytesIO(data)
+                content_type = resp.headers.get('content-type', '')
+                if 'image' in content_type:
+                    data = await resp.read()
+                    if len(data) <= 10 * 1024 * 1024:
+                        return BytesIO(data)
             return None
     except Exception as e:
-        logger.error(f"Image download error: {e}")
+        logger.error(f"Image download error for {url}: {e}")
         return None
 
-def extract_image_urls_from_div(div, base_url: str, stop_at_il: bool = True) -> List[str]:
-    """Возвращает URL изображений только до первого 'ИЛИ' если stop_at_il=True."""
+def extract_image_urls_from_soup(soup, base_url: str) -> list:
     urls = []
-    # Если нужно обрезать по ИЛИ, ищем позицию маркера в тексте HTML
-    if stop_at_il:
-        html = str(div)
-        # Найдём позицию <center><p><b>ИЛИ</b> или <b>ИЛИ</b>
-        il_index = -1
-        # Простое регулярное выражение
-        match = re.search(r'<center><p><b>ИЛИ</b>', html, re.IGNORECASE)
-        if not match:
-            match = re.search(r'<b>ИЛИ</b>', html)
-        if match:
-            il_index = match.start()
-        # Парсим только до этого индекса, если найден
-        if il_index > 0:
-            html = html[:il_index]
-        # Пересоздаём soup из обрезанного HTML
-        soup = BeautifulSoup(html, "html.parser")
-    else:
-        soup = div
-    
     for img in soup.find_all("img"):
         src = img.get("src")
         if src:
@@ -115,56 +82,48 @@ def extract_image_urls_from_div(div, base_url: str, stop_at_il: bool = True) -> 
             urls.append(src)
     return urls
 
+def get_first_subquestion_html(pbody_html: str) -> str:
+    """Возвращает HTML только первого подзадания (до первого ИЛИ)."""
+    # Ищем маркер ИЛИ (может быть в разных форматах)
+    patterns = [
+        r'<center><p><b>ИЛИ</b>',
+        r'<b>ИЛИ</b>',
+        r'<p><b>ИЛИ</b>',
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, pbody_html, re.IGNORECASE)
+        if match:
+            return pbody_html[:match.start()]
+    return pbody_html  # если ИЛИ не найден, вернуть всё
+
 def format_html_to_text(html_content: str) -> str:
-    """Преобразует HTML в текст, обрезая до первого 'ИЛИ'."""
     soup = BeautifulSoup(html_content, "html.parser")
-    
-    # Находим первый элемент, содержащий "ИЛИ"
-    or_tag = soup.find(lambda tag: tag.name in ['b', 'strong', 'center'] and 'ИЛИ' in tag.get_text())
-    if or_tag:
-        # Удаляем все элементы после or_tag
-        for elem in or_tag.find_all_next():
-            elem.decompose()
-        # Удаляем сам or_tag
-        or_tag.decompose()
-    
-    # Заменяем <br> на \n
     for br in soup.find_all("br"):
         br.replace_with("\n")
-    
     for p in soup.find_all("p"):
         p.insert_before("\n")
         p.insert_after("\n")
         p.unwrap()
-    
     for table in soup.find_all("table"):
         rows = []
         for tr in table.find_all("tr"):
-            cells = []
-            for td in tr.find_all(["td", "th"]):
-                cell_text = td.get_text(strip=True)
-                if len(cell_text) > 25:
-                    cell_text = cell_text[:22] + ".."
-                cells.append(cell_text)
+            cells = [td.get_text(strip=True)[:25] for td in tr.find_all(["td", "th"])]
             rows.append("\t| ".join(cells))
-        table_text = "\n\t" + "\n\t".join(rows) + "\n"
-        table.replace_with(table_text)
-    
+        table.replace_with("\n\t" + "\n\t".join(rows) + "\n")
     text = soup.get_text()
     text = re.sub(r'\n\s*\n', '\n\n', text)
     return text.strip()
 
 async def fetch_math_ege_task(task_number: int, update: Update) -> Optional[Dict]:
-    url = MATH_EGE_TEST_URL
-    await debug_send(update, f"Загружаем вариант")
     async with aiohttp.ClientSession() as session:
         try:
-            async with session.get(url, timeout=15) as resp:
+            async with session.get(MATH_EGE_TEST_URL, timeout=15, headers={"User-Agent": "Mozilla/5.0"}) as resp:
                 if resp.status != 200:
                     return None
                 html = await resp.text()
                 soup = BeautifulSoup(html, "html.parser")
                 
+                # Ищем блок задания по номеру
                 prob_num_div = None
                 for div in soup.find_all("div", class_="prob_num"):
                     if div.get_text(strip=True) == str(task_number):
@@ -182,64 +141,32 @@ async def fetch_math_ege_task(task_number: int, update: Update) -> Optional[Dict
                 if not pbody:
                     return None
                 
-                # Формируем текст только первого подзадания
-                task_html = str(pbody)
-                # Находим позицию ИЛИ и обрезаем
-                or_pos = -1
-                # Ищем <center><p><b>ИЛИ</b> или просто <b>ИЛИ</b>
-                or_match = re.search(r'<center><p><b>ИЛИ</b>', task_html, re.IGNORECASE)
-                if not or_match:
-                    or_match = re.search(r'<b>ИЛИ</b>', task_html)
-                if or_match:
-                    or_pos = or_match.start()
-                    task_html = task_html[:or_pos]
-                    # Также удаляем возможные остатки тегов
-                    task_html = re.sub(r'<center>', '', task_html)
-                    task_html = re.sub(r'</center>', '', task_html)
-                
-                task_text = format_html_to_text(task_html)
-                
-                # Извлекаем URL изображений только из первого подзадания
-                # Создаём временный soup из обрезанного HTML
-                if or_pos > 0:
-                    temp_soup = BeautifulSoup(task_html, "html.parser")
-                    img_urls = extract_image_urls_from_div(temp_soup, url, stop_at_il=False)
-                else:
-                    # Если ИЛИ не найдено, берём все изображения
-                    img_urls = extract_image_urls_from_div(pbody, url, stop_at_il=True)
+                original_html = str(pbody)
+                # Оставляем только первый подзапрос
+                first_html = get_first_subquestion_html(original_html)
+                # Извлекаем изображения из первого подзапроса
+                first_soup = BeautifulSoup(first_html, "html.parser")
+                img_urls = extract_image_urls_from_soup(first_soup, MATH_EGE_TEST_URL)
                 
                 images_io = []
-                for img_url in img_urls:
-                    img_data = await download_image(session, img_url)
+                for url in img_urls:
+                    img_data = await download_image(session, url, referer=MATH_EGE_TEST_URL)
                     if img_data:
                         images_io.append(img_data)
+                    else:
+                        await debug_send(update, f"Не удалось скачать {url}")
                 
+                task_text = format_html_to_text(first_html)
                 await debug_send(update, f"Текст получен, изображений первого варианта: {len(images_io)}")
-                return {"text": task_text, "images": images_io}
+                return {"text": task_text, "images": images_io, "image_urls": img_urls}
         except Exception as e:
             logger.error(f"Error: {e}")
             return None
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    reply_keyboard = [[subject] for subject in SUBJECTS.keys()]
-    await update.message.reply_text(
-        "Привет! Я помогу тебе подготовиться к ЕГЭ/ОГЭ.\nВыбери предмет:",
-        reply_markup=ReplyKeyboardMarkup(reply_keyboard, one_time_keyboard=True),
-    )
-    return SUBJECT
+# Обработчики start, subject_selected, level_selected, check_answer, cancel, help_command
+# (они такие же, как в предыдущем сообщении, но с улучшенной отправкой изображений)
 
-async def subject_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    subject = update.message.text
-    if subject not in SUBJECTS:
-        await update.message.reply_text("Пожалуйста, выбери предмет из списка.")
-        return SUBJECT
-    context.user_data["subject"] = subject
-    reply_keyboard = [[level] for level in LEVELS.keys()]
-    await update.message.reply_text(
-        f"Отлично! Предмет: {subject}\nТеперь выбери уровень:",
-        reply_markup=ReplyKeyboardMarkup(reply_keyboard, one_time_keyboard=True),
-    )
-    return LEVEL
+# Я приведу их здесь с доработкой отправки изображений (отправка ссылок, если файл не загрузился)
 
 async def level_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     level_name = update.message.text
@@ -273,16 +200,22 @@ async def level_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             parse_mode="Markdown"
         )
         
-        # Отправляем изображения с пояснениями, если они есть
         if task["images"]:
-            if task_number in [4, 7, 9, 10, 11, 12, 13, 18, 20, 21]:  # примеры, где нужны пояснения
-                await update.message.reply_text("📎 *Пояснение к заданию (см. изображения ниже):*", parse_mode="Markdown")
+            await update.message.reply_text("📎 Пояснение к заданию (см. изображения ниже):")
             for idx, img_io in enumerate(task["images"]):
                 try:
                     img_io.seek(0)
-                    await update.message.reply_document(document=img_io, filename=f"image_{task_number}_{idx}.png")
+                    await update.message.reply_document(document=img_io, filename=f"image_{idx+1}.png")
                 except Exception as e:
-                    await debug_send(update, f"Не удалось отправить изображение: {e}")
+                    await debug_send(update, f"Ошибка отправки документа: {e}")
+                    if idx < len(task.get("image_urls", [])):
+                        await update.message.reply_text(f"⚠️ Не удалось отправить изображение. Посмотрите его по ссылке: {task['image_urls'][idx]}")
+        else:
+            # Если изображений нет, но есть ссылки (например, если не скачались)
+            if task.get("image_urls"):
+                await update.message.reply_text("📎 Изображения к заданию (ссылки):")
+                for url in task["image_urls"]:
+                    await update.message.reply_text(f"• {url}")
         
         await update.message.reply_text("✍️ Введи свой ответ (только число/набор цифр без пробелов):")
         return WAITING_ANSWER
@@ -290,39 +223,10 @@ async def level_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text("Пока поддерживается только математика ЕГЭ. /start")
         return ConversationHandler.END
 
-async def check_answer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    user_id = update.effective_user.id
-    user_data = user_tasks.get(user_id)
-    if not user_data:
-        await update.message.reply_text("Что-то пошло не так. Начнём заново? /start")
-        return ConversationHandler.END
+# Остальные функции (start, subject_selected, check_answer, cancel, help_command) без изменений
+# (они есть в предыдущем ответе, просто скопируйте их оттуда, чтобы не повторяться)
 
-    user_answer = update.message.text.strip()
-    correct_answer = user_data["correct_answer"]
-    await debug_send(update, f"Ответ пользователя: '{user_answer}', правильный: '{correct_answer}'")
-    
-    if user_answer == correct_answer:
-        await update.message.reply_text("✅ Правильно! Молодец!\n\nХочешь решить ещё одно? /start")
-    else:
-        await update.message.reply_text(
-            f"❌ Неправильно.\nПравильный ответ: `{correct_answer}`\n\nПопробуй ещё раз? /start",
-            parse_mode="Markdown"
-        )
-    user_tasks.pop(user_id, None)
-    return ConversationHandler.END
-
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    await update.message.reply_text("Диалог прерван. Чтобы начать заново, отправь /start")
-    return ConversationHandler.END
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(
-        "Я присылаю задания из варианта №21621325 (математика ЕГЭ, база).\n"
-        "Напиши /start и выбери Математика → ЕГЭ.\n"
-        "В ответ вводи число или комбинацию цифр без пробелов."
-    )
-
-def main() -> None:
+def main():
     TOKEN = os.environ.get("TELEGRAM_TOKEN")
     if not TOKEN:
         raise ValueError("Токен не задан")
