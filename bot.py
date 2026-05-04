@@ -18,7 +18,7 @@ from telegram.ext import (
 )
 
 # ==================== НАСТРОЙКИ ====================
-DEBUG = True   # пока оставим, потом выключим
+DEBUG = True   # можно потом выключить
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.DEBUG if DEBUG else logging.INFO,
@@ -43,7 +43,7 @@ BASE_URLS = {
 # Специально для математики ЕГЭ: фиксированный вариант
 MATH_EGE_TEST_ID = 21621325
 MATH_EGE_ANSWER_URL = f"https://mathb-ege.sdamgia.ru/test?id={MATH_EGE_TEST_ID}&answers=1"
-MATH_EGE_TASK_URL_TEMPLATE = "https://mathb-ege.sdamgia.ru/test?id={}&task_id={}"
+MATH_EGE_TEST_URL = f"https://mathb-ege.sdamgia.ru/test?id={MATH_EGE_TEST_ID}"
 
 user_tasks: Dict[int, Dict] = {}
 
@@ -67,9 +67,10 @@ async def download_image(session: aiohttp.ClientSession, url: str) -> Optional[B
         logger.error(f"Image download error: {e}")
         return None
 
-def extract_image_urls(soup: BeautifulSoup, base_url: str) -> list:
+def extract_image_urls_from_div(div, base_url: str) -> list:
+    """Извлекает все URL изображений из HTML-элемента."""
     urls = []
-    for img in soup.find_all("img"):
+    for img in div.find_all("img"):
         src = img.get("src")
         if src:
             if src.startswith("//"):
@@ -79,11 +80,11 @@ def extract_image_urls(soup: BeautifulSoup, base_url: str) -> list:
             urls.append(src)
     return urls
 
-# ==================== ПАРСИНГ ЗАДАНИЯ ИЗ ФИКСИРОВАННОГО ВАРИАНТА ====================
+# ==================== ПАРСИНГ ЗАДАНИЯ ИЗ ВАРИАНТА ====================
 async def fetch_math_ege_task(task_number: int, update: Update) -> Optional[Dict]:
-    """Получает задание номер task_number из варианта MATH_EGE_TEST_ID"""
-    url = MATH_EGE_TASK_URL_TEMPLATE.format(MATH_EGE_TEST_ID, task_number)
-    await debug_send(update, f"Загружаем задание {task_number}: {url}")
+    """Получает задание номер task_number из варианта (парсит страницу варианта)."""
+    url = MATH_EGE_TEST_URL
+    await debug_send(update, f"Загружаем страницу варианта: {url}")
     async with aiohttp.ClientSession() as session:
         try:
             async with session.get(url, timeout=15) as resp:
@@ -92,28 +93,48 @@ async def fetch_math_ege_task(task_number: int, update: Update) -> Optional[Dict
                     return None
                 html = await resp.text()
                 soup = BeautifulSoup(html, "html.parser")
-                # Ищем блок с заданием. На странице test?task_id=N основное задание находится в div с class="problem" или "pbody"
-                problem_div = soup.find("div", class_="problem") or soup.find("div", class_="pbody")
-                if not problem_div:
-                    await debug_send(update, "Не найден блок задания")
+                
+                # Ищем блок задания по номеру
+                # Вариант: ищем div с классом prob_num и текстом "task_number"
+                prob_num_div = soup.find("div", class_="prob_num", string=str(task_number))
+                if not prob_num_div:
+                    # Альтернативный поиск: ищем div с data-num=task_number
+                    prob_num_div = soup.find("div", class_="prob_num", attrs={"data-num": str(task_number)})
+                if not prob_num_div:
+                    await debug_send(update, f"Не найден блок с номером задания {task_number}")
                     return None
-                # Текст
-                task_text = problem_div.get_text(separator="\n", strip=True)
-                # Изображения
-                img_urls = extract_image_urls(problem_div, url)
+                
+                # Блок с условием находится в следующем sibling с классом prob_view
+                prob_view = prob_num_div.find_next_sibling("div", class_="prob_view")
+                if not prob_view:
+                    await debug_send(update, f"Не найден prob_view для задания {task_number}")
+                    return None
+                
+                # Внутри prob_view ищем div с классом pbody (условие)
+                pbody = prob_view.find("div", class_="pbody")
+                if not pbody:
+                    await debug_send(update, f"Не найден pbody для задания {task_number}")
+                    return None
+                
+                # Получаем текст условия
+                task_text = pbody.get_text(separator="\n", strip=True)
+                
+                # Извлекаем изображения (формулы уже встроены, но рисунки тоже)
+                img_urls = extract_image_urls_from_div(pbody, url)
                 images_io = []
                 for img_url in img_urls:
                     img_data = await download_image(session, img_url)
                     if img_data:
                         images_io.append(img_data)
-                await debug_send(update, f"Текст задания получен, изображений:{len(images_io)}")
+                
+                await debug_send(update, f"Текст задания получен, изображений: {len(images_io)}")
                 return {"text": task_text, "images": images_io}
         except Exception as e:
             logger.error(f"Ошибка при получении задания {task_number}: {e}")
             return None
 
 async def fetch_math_ege_answer(task_number: int, update: Update) -> Optional[str]:
-    """Парсит страницу с ответами варианта, извлекает ответ для задания task_number"""
+    """Парсит страницу с ответами варианта, извлекает ответ для задания task_number."""
     async with aiohttp.ClientSession() as session:
         try:
             async with session.get(MATH_EGE_ANSWER_URL, timeout=15) as resp:
@@ -122,43 +143,47 @@ async def fetch_math_ege_answer(task_number: int, update: Update) -> Optional[st
                     return None
                 html = await resp.text()
                 soup = BeautifulSoup(html, "html.parser")
-                # Ищем элементы, содержащие ответы. Обычно это div.answer, либо td с ответами.
-                # На странице ответов задания нумерованы. Ищем по номеру.
-                # Способ: найти все блоки с номером задания, затем рядом ответ.
-                # Проще: найти элемент, содержащий текст "Задание № X" и взять следующий блок с ответом.
-                tasks = soup.find_all("div", class_="problem")
-                if not tasks:
-                    # Альтернативный поиск
-                    await debug_send(update, "Не найден список заданий на странице ответов")
+                
+                # На странице ответов каждое задание обычно представлено блоком с ответом.
+                # Ищем по номеру задания: например, есть ссылка /problem?id=XXXXX, и рядом ответ.
+                # Простой способ: найти все ссылки /problem?id= и сопоставить с номером.
+                # Но проще: найти блок с классом "answer" или span с id "answer".
+                # В коде страницы ответов ответы часто в таблице.
+                
+                # Метод: ищем все поля ввода ответов (input.test_inp) – но они на странице варианта, не на answers.
+                # На странице answers=1 ответы обычно в div.answer или в тексте.
+                # Поищем блок с текстом, содержащим номер задания.
+                # Допустим, структура: <a name="533213"></a> потом ответ.
+                # Попробуем найти все элементы <a> с name, содержащим номер задачи (id задачи).
+                # Но у нас есть номер задания (1..21), а не ID задачи. Нужно отображение.
+                # Альтернатива: на странице answers есть скрытые поля? Нет.
+                # Воспользуемся тем, что ответы идут по порядку: задание 1 → первый ответ и т.д.
+                # Найдём все элементы с классом answer или содержащие "Ответ:".
+                answers = []
+                for ans_elem in soup.find_all(["div", "span"], class_="answer"):
+                    ans_text = ans_elem.get_text(strip=True)
+                    if ans_text:
+                        answers.append(ans_text)
+                if not answers:
+                    # Попробуем найти все строки с "Ответ:" и взять следующее число/слово
+                    for elem in soup.find_all(text=lambda t: t and "Ответ:" in t):
+                        parent = elem.find_parent()
+                        if parent:
+                            text = parent.get_text(strip=True).replace("Ответ:", "").strip()
+                            if text:
+                                answers.append(text)
+                if len(answers) >= task_number:
+                    correct = answers[task_number-1]
+                    await debug_send(update, f"Найден ответ для задания {task_number}: {correct}")
+                    return correct
+                else:
+                    await debug_send(update, f"Найдено только {len(answers)} ответов, а нужно {task_number}")
                     return None
-                # Обычно на странице answers=1 задания идут по порядку, но с разметкой.
-                # Попробуем найти все просмотром: ищем теги с текстом "Ответ:".
-                # В реальности на странице есть строка "Ответ:" и ниже число.
-                # Можно найти все элементы, содержащие "Ответ:" и взять следующий за ним span/div.
-                for elem in soup.find_all(text=lambda t: t and "Ответ:" in t):
-                    parent = elem.find_parent("div", class_="answer") or elem.find_parent("td")
-                    if parent:
-                        answer_text = parent.get_text(strip=True).replace("Ответ:", "").strip()
-                        if answer_text:
-                            # Проверяем, что ответ похож на число/слово
-                            await debug_send(update, f"Найден ответ: {answer_text}")
-                            return answer_text
-                # Если не нашли, попробуем достать ответ из таблицы ответов (иногда они в div с class="answers")
-                answers_div = soup.find("div", class_="answers")
-                if answers_div:
-                    # Нужно сопоставить номеру задания – просто берём по индексу
-                    all_answers = answers_div.find_all("div", class_="answer")
-                    if 1 <= task_number <= len(all_answers):
-                        ans = all_answers[task_number-1].get_text(strip=True)
-                        await debug_send(update, f"Ответ из таблицы: {ans}")
-                        return ans
-                await debug_send(update, "Не удалось извлечь ответ со страницы")
-                return None
         except Exception as e:
             logger.error(f"Ошибка получения ответа: {e}")
             return None
 
-# ==================== ОБРАБОТЧИКИ ДИАЛОГА ====================
+# ==================== ОБРАБОТЧИКИ ДИАЛОГА (без изменений) ====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     reply_keyboard = [[subject] for subject in SUBJECTS.keys()]
     await update.message.reply_text(
@@ -252,7 +277,7 @@ async def level_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return WAITING_ANSWER
 
 async def fetch_random_task_old(level: str, subject_id: int, update: Update) -> Optional[Dict]:
-    """Старый метод (для других предметов)"""
+    """Старый метод для других предметов"""
     base_url = BASE_URLS[level]
     async with aiohttp.ClientSession() as session:
         for _ in range(20):
@@ -273,7 +298,7 @@ async def fetch_random_task_old(level: str, subject_id: int, update: Update) -> 
                             continue
                         correct_answer = answer_elem.get_text(strip=True)
                         # Изображения
-                        img_urls = extract_image_urls(problem_div, base_url)
+                        img_urls = extract_image_urls_from_div(problem_div, base_url)
                         images_io = []
                         for url in img_urls:
                             img = await download_image(session, url)
