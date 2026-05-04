@@ -33,16 +33,38 @@ SUBJECTS = {
     "Физика": {"ege": 3, "oge": 3},
 }
 LEVELS = {"ЕГЭ": "ege", "ОГЭ": "oge"}
+
+# Базовые URL не используются для математики, но оставим
 BASE_URLS = {"ege": "https://ege.sdamgia.ru", "oge": "https://oge.sdamgia.ru"}
 
 MATH_EGE_TEST_ID = 21621325
 MATH_EGE_TEST_URL = f"https://mathb-ege.sdamgia.ru/test?id={MATH_EGE_TEST_ID}"
 
+# Правильные ответы для первого подзадания каждого номера (вручную)
 CORRECT_ANSWERS = {
-    1: "7", 2: "3142", 3: "22", 4: "25", 5: "0.2", 6: "236", 7: "4321", 8: "24", 9: "6",
-    10: "1500", 11: "24500", 12: "12", 13: "270", 14: "24.7", 15: "297", 16: "4", 17: "5",
-    18: "4321", 19: "222", 20: "4", 21: "6",
+    1: "7",      # шоколадки
+    2: "3142",   # соответствие величин
+    3: "22",     # диаграмма температура
+    4: "25",     # работа постоянного тока
+    5: "0.2",    # вероятность
+    6: "236",    # экскурсии (2,3,6)
+    7: "4321",   # производная
+    8: "24",     # печенье утверждения 2 и 4
+    9: "6",      # площадь озера
+    10: "1500",  # участок минус дом
+    11: "24500", # объём детали
+    12: "12",    # медиана
+    13: "270",   # конус
+    14: "24.7",  # выражение (3.1+3.4)*3.8
+    15: "297",   # книга со скидкой
+    16: "4",     # 12^12/(2^14*6^11)
+    17: "5",     # корень уравнения
+    18: "4321",  # соответствие точек и чисел
+    19: "222",   # трёхзначное число с чётными цифрами
+    20: "4",     # встреча
+    21: "6",     # верных ответов
 }
+
 user_tasks: Dict[int, Dict] = {}
 
 async def debug_send(update: Update, text: str):
@@ -84,7 +106,7 @@ def extract_image_urls_from_soup(soup, base_url: str) -> list:
 
 def get_first_subquestion_html(pbody_html: str) -> str:
     """Возвращает HTML только первого подзадания (до первого ИЛИ)."""
-    # Ищем маркер ИЛИ (может быть в разных форматах)
+    # Ищем маркер ИЛИ в разных форматах
     patterns = [
         r'<center><p><b>ИЛИ</b>',
         r'<b>ИЛИ</b>',
@@ -94,7 +116,7 @@ def get_first_subquestion_html(pbody_html: str) -> str:
         match = re.search(pattern, pbody_html, re.IGNORECASE)
         if match:
             return pbody_html[:match.start()]
-    return pbody_html  # если ИЛИ не найден, вернуть всё
+    return pbody_html
 
 def format_html_to_text(html_content: str) -> str:
     soup = BeautifulSoup(html_content, "html.parser")
@@ -119,11 +141,12 @@ async def fetch_math_ege_task(task_number: int, update: Update) -> Optional[Dict
         try:
             async with session.get(MATH_EGE_TEST_URL, timeout=15, headers={"User-Agent": "Mozilla/5.0"}) as resp:
                 if resp.status != 200:
+                    await debug_send(update, f"Ошибка HTTP {resp.status}")
                     return None
                 html = await resp.text()
                 soup = BeautifulSoup(html, "html.parser")
                 
-                # Ищем блок задания по номеру
+                # Находим блок задания по номеру
                 prob_num_div = None
                 for div in soup.find_all("div", class_="prob_num"):
                     if div.get_text(strip=True) == str(task_number):
@@ -142,9 +165,7 @@ async def fetch_math_ege_task(task_number: int, update: Update) -> Optional[Dict
                     return None
                 
                 original_html = str(pbody)
-                # Оставляем только первый подзапрос
                 first_html = get_first_subquestion_html(original_html)
-                # Извлекаем изображения из первого подзапроса
                 first_soup = BeautifulSoup(first_html, "html.parser")
                 img_urls = extract_image_urls_from_soup(first_soup, MATH_EGE_TEST_URL)
                 
@@ -163,10 +184,27 @@ async def fetch_math_ege_task(task_number: int, update: Update) -> Optional[Dict
             logger.error(f"Error: {e}")
             return None
 
-# Обработчики start, subject_selected, level_selected, check_answer, cancel, help_command
-# (они такие же, как в предыдущем сообщении, но с улучшенной отправкой изображений)
+# ==================== ОБРАБОТЧИКИ КОМАНД ====================
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    reply_keyboard = [[subject] for subject in SUBJECTS.keys()]
+    await update.message.reply_text(
+        "Привет! Я помогу тебе подготовиться к ЕГЭ/ОГЭ.\nВыбери предмет:",
+        reply_markup=ReplyKeyboardMarkup(reply_keyboard, one_time_keyboard=True),
+    )
+    return SUBJECT
 
-# Я приведу их здесь с доработкой отправки изображений (отправка ссылок, если файл не загрузился)
+async def subject_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    subject = update.message.text
+    if subject not in SUBJECTS:
+        await update.message.reply_text("Пожалуйста, выбери предмет из списка.")
+        return SUBJECT
+    context.user_data["subject"] = subject
+    reply_keyboard = [[level] for level in LEVELS.keys()]
+    await update.message.reply_text(
+        f"Отлично! Предмет: {subject}\nТеперь выбери уровень:",
+        reply_markup=ReplyKeyboardMarkup(reply_keyboard, one_time_keyboard=True),
+    )
+    return LEVEL
 
 async def level_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     level_name = update.message.text
@@ -191,9 +229,7 @@ async def level_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             return ConversationHandler.END
         
         user_id = update.effective_user.id
-        user_tasks[user_id] = {
-            "correct_answer": correct_answer,
-        }
+        user_tasks[user_id] = {"correct_answer": correct_answer}
         
         await update.message.reply_text(
             f"📘 *Задание {task_number} (ЕГЭ, Математика)*\n\n{task['text']}",
@@ -208,10 +244,10 @@ async def level_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     await update.message.reply_document(document=img_io, filename=f"image_{idx+1}.png")
                 except Exception as e:
                     await debug_send(update, f"Ошибка отправки документа: {e}")
+                    # Если документ не отправился, даём ссылку
                     if idx < len(task.get("image_urls", [])):
-                        await update.message.reply_text(f"⚠️ Не удалось отправить изображение. Посмотрите его по ссылке: {task['image_urls'][idx]}")
+                        await update.message.reply_text(f"⚠️ Не удалось отправить изображение. Ссылка: {task['image_urls'][idx]}")
         else:
-            # Если изображений нет, но есть ссылки (например, если не скачались)
             if task.get("image_urls"):
                 await update.message.reply_text("📎 Изображения к заданию (ссылки):")
                 for url in task["image_urls"]:
@@ -223,10 +259,39 @@ async def level_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text("Пока поддерживается только математика ЕГЭ. /start")
         return ConversationHandler.END
 
-# Остальные функции (start, subject_selected, check_answer, cancel, help_command) без изменений
-# (они есть в предыдущем ответе, просто скопируйте их оттуда, чтобы не повторяться)
+async def check_answer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user_id = update.effective_user.id
+    user_data = user_tasks.get(user_id)
+    if not user_data:
+        await update.message.reply_text("Что-то пошло не так. Начнём заново? /start")
+        return ConversationHandler.END
 
-def main():
+    user_answer = update.message.text.strip()
+    correct_answer = user_data["correct_answer"]
+    await debug_send(update, f"Ответ пользователя: '{user_answer}', правильный: '{correct_answer}'")
+    
+    if user_answer == correct_answer:
+        await update.message.reply_text("✅ Правильно! Молодец!\n\nХочешь решить ещё одно? /start")
+    else:
+        await update.message.reply_text(
+            f"❌ Неправильно.\nПравильный ответ: `{correct_answer}`\n\nПопробуй ещё раз? /start",
+            parse_mode="Markdown"
+        )
+    user_tasks.pop(user_id, None)
+    return ConversationHandler.END
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await update.message.reply_text("Диалог прерван. Чтобы начать заново, отправь /start")
+    return ConversationHandler.END
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(
+        "Я присылаю задания из варианта №21621325 (математика ЕГЭ, база).\n"
+        "Напиши /start и выбери Математика → ЕГЭ.\n"
+        "В ответ вводи число или комбинацию цифр без пробелов."
+    )
+
+def main() -> None:
     TOKEN = os.environ.get("TELEGRAM_TOKEN")
     if not TOKEN:
         raise ValueError("Токен не задан")
