@@ -18,14 +18,6 @@ from telegram.ext import (
     filters,
 )
 
-# Попытка импорта для конвертации SVG
-try:
-    import cairosvg
-    CAIRO_AVAILABLE = True
-except ImportError:
-    CAIRO_AVAILABLE = False
-    logging.warning("cairosvg not installed, SVG images will be sent as documents")
-
 DEBUG = True
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -68,7 +60,6 @@ async def download_image(session: aiohttp.ClientSession, url: str, referer: str)
     try:
         async with session.get(url, timeout=10, headers=headers) as resp:
             if resp.status == 200:
-                content_type = resp.headers.get('content-type', '')
                 data = await resp.read()
                 if len(data) <= 10 * 1024 * 1024:
                     return BytesIO(data)
@@ -153,37 +144,31 @@ async def fetch_math_ege_task(task_number: int, update: Update) -> Optional[Dict
                     else:
                         await debug_send(update, f"Не удалось скачать {url}")
                 task_text = format_html_to_text(first_html)
-                await debug_send(update, f"Текст получен, изображений первого варианта: {len(images_io)} из {len(img_urls)}")
+                await debug_send(update, f"Текст получен, изображений: {len(images_io)} из {len(img_urls)}")
                 return {"text": task_text, "images": images_io, "image_urls": img_urls}
         except Exception as e:
             logger.error(f"Error: {e}")
             return None
 
-async def send_image_as_photo(update: Update, image_bytes: BytesIO, filename: str) -> bool:
-    """Отправляет изображение как фото, конвертируя SVG в PNG при необходимости."""
+async def send_image(update: Update, image_bytes: BytesIO) -> bool:
+    """Отправляет изображение: фото для PNG/JPG, документ для SVG."""
     image_bytes.seek(0)
     header = image_bytes.read(10)
     image_bytes.seek(0)
-    if header.startswith(b'<svg') or b'<svg' in header:
-        if CAIRO_AVAILABLE:
-            try:
-                png_data = cairosvg.svg2png(bytestring=image_bytes.read())
-                png_io = BytesIO(png_data)
-                png_io.seek(0)
-                await update.message.reply_photo(photo=png_io)
-                return True
-            except Exception as e:
-                logger.error(f"SVG conversion failed: {e}")
-                return False
-        else:
-            return False
-    else:
-        try:
-            await update.message.reply_photo(photo=image_bytes)
-            return True
-        except Exception as e:
-            logger.error(f"Photo send failed: {e}")
-            return False
+    is_svg = (header.startswith(b'<svg') or b'<svg' in header)
+    if is_svg:
+        await update.message.reply_document(document=image_bytes, filename="image.svg")
+        await update.message.reply_text("⚠️ Изображение отправлено как файл (SVG).")
+        return False
+    try:
+        await update.message.reply_photo(photo=image_bytes)
+        return True
+    except Exception as e:
+        logger.error(f"Photo send failed: {e}")
+        image_bytes.seek(0)
+        await update.message.reply_document(document=image_bytes, filename="image.png")
+        await update.message.reply_text("⚠️ Изображение отправлено как файл.")
+        return False
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     reply_keyboard = [[subject] for subject in SUBJECTS.keys()]
@@ -233,13 +218,8 @@ async def level_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         if task["images"]:
             await update.message.reply_text("📎 Пояснение к заданию (см. изображения ниже):")
-            for idx, img_io in enumerate(task["images"]):
-                success = await send_image_as_photo(update, img_io, f"image_{idx+1}.png")
-                if not success:
-                    # fallback: отправить как документ
-                    img_io.seek(0)
-                    await update.message.reply_document(document=img_io, filename=f"image_{idx+1}.svg")
-                    await update.message.reply_text("⚠️ Изображение отправлено в виде файла, так как не удалось отобразить как фото.")
+            for img_io in task["images"]:
+                await send_image(update, img_io)
         else:
             if task.get("image_urls"):
                 await update.message.reply_text("📎 Изображения к заданию (ссылки):")

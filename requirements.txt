@@ -1,5 +1,3 @@
-python-telegram-bot
-aiohttp 
-beautifulsoup4 
-cairosvg
-Pillow
+python-telegram-bot>=20.0
+aiohttp
+beautifulsoup4
