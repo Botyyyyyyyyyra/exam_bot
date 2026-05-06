@@ -288,60 +288,66 @@ async def fetch_math_task(test_url: str, task_number: int, update: Update) -> Op
             return None
 
 async def fetch_russian_task(problem_id: int, update: Update) -> Optional[Dict]:
-    """Загружает страницу конкретного задания по ID."""
     url = f"{RUS_EGE_BASE_URL}/problem?id={problem_id}"
-    await debug_send(update, f"fetch_russian_task: загрузка {url}")
+    await debug_send(update, f"Загрузка {url}")
     async with aiohttp.ClientSession() as session:
         try:
             async with session.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"}) as resp:
                 if resp.status != 200:
-                    await debug_send(update, f"Ошибка HTTP {resp.status}")
+                    await debug_send(update, f"HTTP {resp.status}")
                     return None
                 html = await resp.text()
                 soup = BeautifulSoup(html, "html.parser")
                 
-                # Находим блок с заданием (несколько способов)
-                prob_view = soup.find("div", class_="prob_view")
-                if not prob_view:
-                    # Пробуем найти через CSS-селектор
-                    prob_view = soup.select_one("div.prob_view")
-                if not prob_view:
-                    # Ищем любой div с классом, содержащим "prob"
-                    prob_view = soup.find("div", class_=re.compile(r"prob"))
-                if not prob_view:
-                    # Прямой поиск pbody
-                    pbody = soup.find("div", class_="pbody")
-                    if pbody:
-                        prob_view = pbody.parent
-                    else:
-                        await debug_send(update, "Не найден prob_view или pbody")
-                        return None
-                
-                # Теперь ищем pbody внутри prob_view
-                pbody = prob_view.find("div", class_="pbody")
+                # Находим pbody
+                pbody = soup.find("div", class_="pbody")
                 if not pbody:
-                    # Может быть, pbody — это сам prob_view?
-                    pbody = prob_view
+                    await debug_send(update, "Не найден pbody")
+                    return None
                 
-                # Очистка от лишних пояснений
-                cleaned_pbody = clean_task_soup(pbody)
-                original_html = str(cleaned_pbody)
-                first_html = get_first_subquestion_html(original_html)
-                first_soup = BeautifulSoup(first_html, "html.parser")
+                # Получаем текст, но удаляем всё после "Пояснение" или "Правило"
+                full_text = pbody.get_text(separator="\n", strip=True)
                 
-                img_urls = extract_image_urls_from_soup(first_soup, url)
+                # Обрезаем текст до первого вхождения ключевых слов
+                stop_words = ["Пояснение", "Правило", "Решение", "Ответ:", "Правило:", "Пояснение (см.", "Правило 6 ЕГЭ"]
+                cutoff = len(full_text)
+                for word in stop_words:
+                    idx = full_text.find(word)
+                    if idx != -1 and idx < cutoff:
+                        cutoff = idx
+                if cutoff < len(full_text):
+                    full_text = full_text[:cutoff].strip()
+                
+                # Дополнительная очистка от лишних строк
+                lines = full_text.split('\n')
+                cleaned_lines = []
+                for line in lines:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    # Пропускаем строки, похожие на заголовки правил
+                    if re.match(r'^(Тип \d+|Задание \d+|Правило|Условие|Комментарий|Алгоритм|ВНИМАНИЕ)', line):
+                        continue
+                    cleaned_lines.append(line)
+                
+                task_text = '\n'.join(cleaned_lines)
+                if not task_text:
+                    await debug_send(update, "Текст пуст после очистки")
+                    return None
+                
+                # Извлечение изображений
+                img_urls = extract_image_urls_from_soup(pbody, url)
                 images_io = []
                 for img_url in img_urls:
                     img_data = await download_image(session, img_url, referer=url)
                     if img_data:
                         images_io.append(img_data)
                 
-                task_text = format_html_to_text(first_html)
-                await debug_send(update, f"Русский: текст получен ({len(task_text)} символов), изображений: {len(images_io)}")
+                await debug_send(update, f"Текст получен ({len(task_text)} символов), изображений: {len(images_io)}")
                 return {"text": task_text, "images": images_io}
         except Exception as e:
             logger.error(f"Russian error: {e}")
-            await debug_send(update, f"Исключение: {e}")
+            await debug_send(update, f"Ошибка: {e}")
             return None
 
 # ---------- Обработчики диалога ----------
