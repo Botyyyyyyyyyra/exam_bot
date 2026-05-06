@@ -3,7 +3,7 @@ import logging
 import os
 import random
 import re
-from typing import Dict, Optional
+from typing import Dict, Optional, List
 from io import BytesIO
 
 import aiohttp
@@ -72,10 +72,29 @@ async def debug_send(update: Update, text: str):
         except:
             pass
 
-async def send_long_text(update: Update, text: str, prefix: str = ""):
+async def delete_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Удаляет сообщения, сохранённые в context.user_data['bot_messages']."""
+    bot_messages = context.user_data.get("bot_messages", [])
+    for msg_id in bot_messages:
+        try:
+            await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=msg_id)
+        except Exception as e:
+            logger.debug(f"Не удалось удалить сообщение {msg_id}: {e}")
+    context.user_data["bot_messages"] = []
+    # Также удаляем сообщение пользователя, если оно не удалено ранее
+    try:
+        await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=update.message.message_id)
+    except:
+        pass
+
+async def send_long_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, prefix: str = ""):
+    """Разбивает длинный текст на части и сохраняет ID отправленных сообщений."""
     MAX_LEN = 4096
+    bot_messages = context.user_data.get("bot_messages", [])
     if len(text) <= MAX_LEN:
-        await update.message.reply_text(f"{prefix}\n\n⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯\n\n{text}", parse_mode="Markdown")
+        msg = await update.message.reply_text(f"{prefix}\n\n⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯\n\n{text}", parse_mode="Markdown")
+        bot_messages.append(msg.message_id)
+        context.user_data["bot_messages"] = bot_messages
         return
     parts = []
     current = ""
@@ -89,7 +108,9 @@ async def send_long_text(update: Update, text: str, prefix: str = ""):
         parts.append(current)
     for i, part in enumerate(parts, 1):
         header = f"{prefix} (часть {i}/{len(parts)})\n\n⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯\n\n" if len(parts) > 1 else f"{prefix}\n\n⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯\n\n"
-        await update.message.reply_text(f"{header}{part}", parse_mode="Markdown")
+        msg = await update.message.reply_text(f"{header}{part}", parse_mode="Markdown")
+        bot_messages.append(msg.message_id)
+    context.user_data["bot_messages"] = bot_messages
 
 def get_image_extension(data: bytes) -> str:
     if data[:4] == b'\x89PNG':
@@ -121,7 +142,8 @@ async def download_image(session: aiohttp.ClientSession, url: str, referer: str)
         logger.error(f"Image download error: {e}")
         return None
 
-async def send_image(update: Update, image_bytes: BytesIO) -> bool:
+async def send_image(update: Update, context: ContextTypes.DEFAULT_TYPE, image_bytes: BytesIO) -> bool:
+    """Отправляет изображение и сохраняет его ID."""
     try:
         image_bytes.seek(0)
         data = image_bytes.read()
@@ -130,7 +152,10 @@ async def send_image(update: Update, image_bytes: BytesIO) -> bool:
         ext = get_image_extension(data)
         filename = f"image{ext}"
         image_bytes.seek(0)
-        await update.message.reply_document(document=image_bytes, filename=filename)
+        msg = await update.message.reply_document(document=image_bytes, filename=filename)
+        bot_messages = context.user_data.get("bot_messages", [])
+        bot_messages.append(msg.message_id)
+        context.user_data["bot_messages"] = bot_messages
         return True
     except Exception as e:
         logger.error(f"Send document failed: {e}")
@@ -249,56 +274,44 @@ async def fetch_russian_task(test_url: str, task_number: int, update: Update) ->
 
 # ---------- Обработчики диалога ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    # Удаляем старые сообщения бота, если есть
+    await delete_messages(update, context)
     reply_keyboard = [[subject] for subject in SUBJECTS.keys()]
-    await update.message.reply_text(
+    msg = await update.message.reply_text(
         "📚 *Добро пожаловать в бот для подготовки к ЕГЭ/ОГЭ!*\n\n"
         "Я умею присылать реальные задания с сайта Решу ЕГЭ/ОГЭ.\n"
         "Выбери предмет:",
         reply_markup=ReplyKeyboardMarkup(reply_keyboard, one_time_keyboard=True),
         parse_mode="Markdown"
     )
+    context.user_data["bot_messages"] = [msg.message_id]
     return SUBJECT
 
 async def subject_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     text = update.message.text
     if text == '🏠 Главное меню':
+        await delete_messages(update, context)
         return await start(update, context)
-    if text == '✅ Решить ещё раз':
-        # Повтор последнего задания
-        subject = context.user_data.get("last_subject")
-        level = context.user_data.get("last_level")
-        if subject and level:
-            context.user_data["subject"] = subject
-            # Прямой вызов level_selected с нужным уровнем
-            update.message.text = level
-            return await level_selected(update, context)
-        else:
-            return await start(update, context)
 
     if text not in SUBJECTS:
         await update.message.reply_text("Пожалуйста, выбери предмет из списка.", reply_markup=ReplyKeyboardMarkup([[s] for s in SUBJECTS.keys()], one_time_keyboard=True))
         return SUBJECT
     context.user_data["subject"] = text
     reply_keyboard = [[level] for level in LEVELS.keys()]
-    await update.message.reply_text(
+    msg = await update.message.reply_text(
         f"Отлично! Предмет: {text}\nТеперь выбери уровень:",
         reply_markup=ReplyKeyboardMarkup(reply_keyboard, one_time_keyboard=True),
     )
+    bot_messages = context.user_data.get("bot_messages", [])
+    bot_messages.append(msg.message_id)
+    context.user_data["bot_messages"] = bot_messages
     return LEVEL
 
 async def level_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     level_name = update.message.text
     if level_name == '🏠 Главное меню':
+        await delete_messages(update, context)
         return await start(update, context)
-    if level_name == '✅ Решить ещё раз':
-        subject = context.user_data.get("last_subject")
-        level = context.user_data.get("last_level")
-        if subject and level:
-            context.user_data["subject"] = subject
-            update.message.text = level
-            return await level_selected(update, context)
-        else:
-            return await start(update, context)
 
     if level_name not in LEVELS:
         await update.message.reply_text("Пожалуйста, выбери уровень из списка.", reply_markup=ReplyKeyboardMarkup([[l] for l in LEVELS.keys()], one_time_keyboard=True))
@@ -306,8 +319,6 @@ async def level_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     subject = context.user_data.get("subject")
     level_code = LEVELS[level_name]
-    context.user_data["last_subject"] = subject
-    context.user_data["last_level"] = level_name
 
     # Математика
     if subject == "Математика":
@@ -322,33 +333,46 @@ async def level_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
         task = await fetch_math_task(task_url, task_number, update)
         if not task:
-            await update.message.reply_text("Не удалось загрузить задание. Попробуйте позже.")
+            msg = await update.message.reply_text("Не удалось загрузить задание. Попробуйте позже.")
+            bot_messages = context.user_data.get("bot_messages", [])
+            bot_messages.append(msg.message_id)
+            context.user_data["bot_messages"] = bot_messages
             return ConversationHandler.END
 
         correct_answer = correct_answers.get(task_number)
         if not correct_answer:
-            await update.message.reply_text("Нет правильного ответа для этого задания. Попробуйте другое /start")
+            msg = await update.message.reply_text("Нет правильного ответа для этого задания. Попробуйте другое /start")
+            bot_messages = context.user_data.get("bot_messages", [])
+            bot_messages.append(msg.message_id)
+            context.user_data["bot_messages"] = bot_messages
             return ConversationHandler.END
 
         user_id = update.effective_user.id
         user_tasks[user_id] = {"correct_answer": correct_answer}
 
-        await update.message.reply_text(
+        msg = await update.message.reply_text(
             f"📘 *Задание {task_number} ({subject}, {level_name})*\n\n⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯\n\n{task['text']}",
             parse_mode="Markdown"
         )
+        bot_messages = context.user_data.get("bot_messages", [])
+        bot_messages.append(msg.message_id)
         if task["images"]:
-            await update.message.reply_text("📎 Пояснение к заданию (изображения ниже):")
+            caption_msg = await update.message.reply_text("📎 Пояснение к заданию (изображения ниже):")
+            bot_messages.append(caption_msg.message_id)
             for img_io in task["images"]:
-                await send_image(update, img_io)
-
-        await update.message.reply_text("✍️ Введи свой ответ (только число/набор цифр без пробелов):")
+                await send_image(update, context, img_io)
+        request_msg = await update.message.reply_text("✍️ Введи свой ответ (только число/набор цифр без пробелов):")
+        bot_messages.append(request_msg.message_id)
+        context.user_data["bot_messages"] = bot_messages
         return WAITING_ANSWER
 
     # Русский язык
     elif subject == "Русский язык":
         if level_code != "ege":
-            await update.message.reply_text("Для русского языка пока доступен только ЕГЭ.")
+            msg = await update.message.reply_text("Для русского языка пока доступен только ЕГЭ.")
+            bot_messages = context.user_data.get("bot_messages", [])
+            bot_messages.append(msg.message_id)
+            context.user_data["bot_messages"] = bot_messages
             return ConversationHandler.END
 
         task_number = random.randint(1, 26)
@@ -357,28 +381,42 @@ async def level_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
         task = await fetch_russian_task(task_url, task_number, update)
         if not task:
-            await update.message.reply_text("Не удалось загрузить задание. Попробуйте позже.")
+            msg = await update.message.reply_text("Не удалось загрузить задание. Попробуйте позже.")
+            bot_messages = context.user_data.get("bot_messages", [])
+            bot_messages.append(msg.message_id)
+            context.user_data["bot_messages"] = bot_messages
             return ConversationHandler.END
 
         correct_answer = correct_answers.get(task_number)
         if not correct_answer:
-            await update.message.reply_text("Нет правильного ответа для этого задания. Попробуйте другое /start")
+            msg = await update.message.reply_text("Нет правильного ответа для этого задания. Попробуйте другое /start")
+            bot_messages = context.user_data.get("bot_messages", [])
+            bot_messages.append(msg.message_id)
+            context.user_data["bot_messages"] = bot_messages
             return ConversationHandler.END
 
         user_id = update.effective_user.id
         user_tasks[user_id] = {"correct_answer": correct_answer}
 
-        await send_long_text(update, task['text'], f"📖 *Задание {task_number} ({subject}, ЕГЭ)*")
+        await send_long_text(update, context, task['text'], f"📖 *Задание {task_number} ({subject}, ЕГЭ)*")
         if task["images"]:
-            await update.message.reply_text("📎 Пояснение к заданию (изображения ниже):")
+            caption_msg = await update.message.reply_text("📎 Пояснение к заданию (изображения ниже):")
+            bot_messages = context.user_data.get("bot_messages", [])
+            bot_messages.append(caption_msg.message_id)
+            context.user_data["bot_messages"] = bot_messages
             for img_io in task["images"]:
-                await send_image(update, img_io)
-
-        await update.message.reply_text("✍️ Введи свой ответ (слово, число или последовательность цифр без пробелов):")
+                await send_image(update, context, img_io)
+        request_msg = await update.message.reply_text("✍️ Введи свой ответ (слово, число или последовательность цифр без пробелов):")
+        bot_messages = context.user_data.get("bot_messages", [])
+        bot_messages.append(request_msg.message_id)
+        context.user_data["bot_messages"] = bot_messages
         return WAITING_ANSWER
 
     else:
-        await update.message.reply_text("Предмет пока не поддерживается. Выберите Математику или Русский язык.")
+        msg = await update.message.reply_text("Предмет пока не поддерживается. Выберите Математику или Русский язык.")
+        bot_messages = context.user_data.get("bot_messages", [])
+        bot_messages.append(msg.message_id)
+        context.user_data["bot_messages"] = bot_messages
         return ConversationHandler.END
 
 async def check_answer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -391,50 +429,54 @@ async def check_answer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     user_answer = update.message.text.strip()
     correct_answer = user_data["correct_answer"]
 
-    action_keyboard = [['✅ Решить ещё раз'], ['🏠 Главное меню']]
+    action_keyboard = [['🏠 Главное меню']]
     action_markup = ReplyKeyboardMarkup(action_keyboard, one_time_keyboard=False, resize_keyboard=True)
 
+    # Удаляем сообщение пользователя с ответом
+    try:
+        await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=update.message.message_id)
+    except:
+        pass
+
     if user_answer == correct_answer:
-        await update.message.reply_text(
+        msg = await update.message.reply_text(
             "✅ *Правильно! Молодец!*\n\nЧто хочешь сделать дальше?",
             parse_mode="Markdown",
             reply_markup=action_markup
         )
     else:
-        await update.message.reply_text(
+        msg = await update.message.reply_text(
             f"❌ *Неправильно.*\nПравильный ответ: `{correct_answer}`\n\nЧто хочешь сделать дальше?",
             parse_mode="Markdown",
             reply_markup=action_markup
         )
 
+    bot_messages = context.user_data.get("bot_messages", [])
+    bot_messages.append(msg.message_id)
+    context.user_data["bot_messages"] = bot_messages
     user_tasks.pop(user_id, None)
     return ACTION
 
 async def action_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     text = update.message.text
-    if text == '✅ Решить ещё раз':
-        subject = context.user_data.get("last_subject")
-        level = context.user_data.get("last_level")
-        if subject and level:
-            context.user_data["subject"] = subject
-            # Повторяем выбор уровня
-            update.message.text = level
-            return await level_selected(update, context)
-        else:
-            return await start(update, context)
-    elif text == '🏠 Главное меню':
+    if text == '🏠 Главное меню':
+        await delete_messages(update, context)
         return await start(update, context)
     else:
         # Если пользователь ввёл что-то другое – повторяем предложение
-        action_keyboard = [['✅ Решить ещё раз'], ['🏠 Главное меню']]
+        action_keyboard = [['🏠 Главное меню']]
         action_markup = ReplyKeyboardMarkup(action_keyboard, one_time_keyboard=False, resize_keyboard=True)
-        await update.message.reply_text(
-            "Пожалуйста, выбери действие с помощью кнопок:",
+        msg = await update.message.reply_text(
+            "Пожалуйста, выбери действие с помощью кнопки:",
             reply_markup=action_markup
         )
+        bot_messages = context.user_data.get("bot_messages", [])
+        bot_messages.append(msg.message_id)
+        context.user_data["bot_messages"] = bot_messages
         return ACTION
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await delete_messages(update, context)
     await update.message.reply_text("Диалог прерван. Чтобы начать заново, отправь /start")
     return ConversationHandler.END
 
@@ -448,7 +490,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "Управление:\n"
         "• /start – начать диалог\n"
         "• /help – эта справка\n"
-        "• после ответа используй кнопки «Решить ещё раз» или «Главное меню»",
+        "• после ответа используй кнопку «Главное меню» для возврата",
         parse_mode="Markdown"
     )
 
