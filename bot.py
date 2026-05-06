@@ -73,7 +73,6 @@ async def debug_send(update: Update, text: str):
             pass
 
 async def send_long_text(update: Update, text: str, prefix: str = ""):
-    """Разбивает длинный текст на части с разделителем."""
     MAX_LEN = 4096
     if len(text) <= MAX_LEN:
         await update.message.reply_text(f"{prefix}\n\n⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯\n\n{text}", parse_mode="Markdown")
@@ -108,27 +107,21 @@ def get_image_extension(data: bytes) -> str:
 async def download_image(session: aiohttp.ClientSession, url: str, referer: str) -> Optional[BytesIO]:
     headers = {
         "Referer": referer,
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
     }
     try:
         async with session.get(url, timeout=15, headers=headers) as resp:
             if resp.status != 200:
-                logger.warning(f"Image download HTTP {resp.status} for {url}")
                 return None
             data = await resp.read()
-            if not data:
-                logger.warning(f"Empty image data for {url}")
-                return None
-            if len(data) > 10 * 1024 * 1024:
-                logger.warning(f"Image too large: {len(data)} bytes for {url}")
+            if not data or len(data) > 10 * 1024 * 1024:
                 return None
             return BytesIO(data)
     except Exception as e:
-        logger.error(f"Image download error for {url}: {e}")
+        logger.error(f"Image download error: {e}")
         return None
 
 async def send_image(update: Update, image_bytes: BytesIO) -> bool:
-    """Отправляет изображение как документ с правильным расширением."""
     try:
         image_bytes.seek(0)
         data = image_bytes.read()
@@ -156,11 +149,7 @@ def extract_image_urls_from_soup(soup, base_url: str) -> list:
     return urls
 
 def get_first_subquestion_html(pbody_html: str) -> str:
-    patterns = [
-        r'<center><p><b>ИЛИ</b>',
-        r'<b>ИЛИ</b>',
-        r'<p><b>ИЛИ</b>',
-    ]
+    patterns = [r'<center><p><b>ИЛИ</b>', r'<b>ИЛИ</b>', r'<p><b>ИЛИ</b>']
     for pattern in patterns:
         match = re.search(pattern, pbody_html, re.IGNORECASE)
         if match:
@@ -200,7 +189,6 @@ async def fetch_math_task(test_url: str, task_number: int, update: Update) -> Op
                         prob_num_div = div
                         break
                 if not prob_num_div:
-                    await debug_send(update, f"Не найден номер {task_number}")
                     return None
                 prob_view = prob_num_div.find_next_sibling("div", class_="prob_view")
                 if not prob_view:
@@ -217,22 +205,17 @@ async def fetch_math_task(test_url: str, task_number: int, update: Update) -> Op
                     img_data = await download_image(session, url, referer=test_url)
                     if img_data:
                         images_io.append(img_data)
-                    else:
-                        await debug_send(update, f"Не удалось скачать {url}")
                 task_text = format_html_to_text(first_html)
-                await debug_send(update, f"Текст получен, изображений: {len(images_io)} из {len(img_urls)}")
-                return {"text": task_text, "images": images_io, "image_urls": img_urls}
+                return {"text": task_text, "images": images_io}
         except Exception as e:
-            logger.error(f"Error: {e}")
+            logger.error(f"Math error: {e}")
             return None
 
 async def fetch_russian_task(test_url: str, task_number: int, update: Update) -> Optional[Dict]:
-    await debug_send(update, f"fetch_russian_task: начало загрузки задания №{task_number}")
     async with aiohttp.ClientSession() as session:
         try:
             async with session.get(test_url, timeout=15, headers={"User-Agent": "Mozilla/5.0"}) as resp:
                 if resp.status != 200:
-                    await debug_send(update, f"Ошибка HTTP {resp.status}")
                     return None
                 html = await resp.text()
                 soup = BeautifulSoup(html, "html.parser")
@@ -242,39 +225,42 @@ async def fetch_russian_task(test_url: str, task_number: int, update: Update) ->
                         prob_num_div = div
                         break
                 if not prob_num_div:
-                    await debug_send(update, f"Не найден номер {task_number}")
                     return None
                 prob_view = prob_num_div.find_next_sibling("div", class_="prob_view")
                 if not prob_view:
-                    await debug_send(update, "Не найден prob_view")
                     return None
                 pbody = prob_view.find("div", class_="pbody")
                 if not pbody:
-                    await debug_send(update, "Не найден pbody")
                     return None
                 original_html = str(pbody)
                 first_html = get_first_subquestion_html(original_html)
                 first_soup = BeautifulSoup(first_html, "html.parser")
                 img_urls = extract_image_urls_from_soup(first_soup, test_url)
-                await debug_send(update, f"Найдено URL изображений: {len(img_urls)}")
                 images_io = []
                 for url in img_urls:
                     img_data = await download_image(session, url, referer=test_url)
                     if img_data:
                         images_io.append(img_data)
-                    else:
-                        await debug_send(update, f"Не удалось скачать {url}")
                 task_text = format_html_to_text(first_html)
-                await debug_send(update, f"Русский: текст получен, изображений: {len(images_io)} из {len(img_urls)}")
-                return {"text": task_text, "images": images_io, "image_urls": img_urls}
+                return {"text": task_text, "images": images_io}
         except Exception as e:
-            logger.error(f"Russian task error: {e}")
-            await debug_send(update, f"Исключение в fetch_russian_task: {e}")
+            logger.error(f"Russian error: {e}")
             return None
 
-# ---------- Обработчики ----------
+# ---------- Обработчики диалога ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Приветствие и главное меню."""
+    # Если есть автоматическое возобновление (после нажатия "Решить ещё раз")
+    if context.user_data.get("auto_resume"):
+        subject = context.user_data.get("last_subject")
+        level = context.user_data.get("last_level")
+        if subject and level:
+            context.user_data["subject"] = subject
+            context.user_data["auto_resume"] = False
+            update.message.text = level
+            return await level_selected(update, context)
+        else:
+            context.user_data["auto_resume"] = False
+    # Обычное начало
     reply_keyboard = [[subject] for subject in SUBJECTS.keys()]
     await update.message.reply_text(
         "📚 *Добро пожаловать в бот для подготовки к ЕГЭ/ОГЭ!*\n\n"
@@ -286,9 +272,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return SUBJECT
 
 async def subject_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Обработка выбора предмета."""
     text = update.message.text
     if text == '🏠 Главное меню':
+        context.user_data.clear()
         return await start(update, context)
     if text == '✅ Решить ещё раз':
         subject = context.user_data.get("last_subject")
@@ -312,9 +298,9 @@ async def subject_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     return LEVEL
 
 async def level_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Обработка выбора уровня и отправка задания."""
     level_name = update.message.text
     if level_name == '🏠 Главное меню':
+        context.user_data.clear()
         return await start(update, context)
     if level_name == '✅ Решить ещё раз':
         subject = context.user_data.get("last_subject")
@@ -332,25 +318,19 @@ async def level_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     subject = context.user_data.get("subject")
     level_code = LEVELS[level_name]
 
-    # Сохраняем последний выбор для кнопки "Решить ещё раз"
     context.user_data["last_subject"] = subject
     context.user_data["last_level"] = level_name
 
-    # ----- Математика -----
+    # Математика
     if subject == "Математика":
         if level_code == "ege":
             task_number = random.randint(1, 21)
             task_url = MATH_EGE_TEST_URL
             correct_answers = CORRECT_ANSWERS_EGE
-            await debug_send(update, f"Выбрано задание №{task_number} (ЕГЭ)")
-        elif level_code == "oge":
+        else:
             task_number = random.randint(1, 19)
             task_url = MATH_OGE_TEST_URL
             correct_answers = CORRECT_ANSWERS_OGE
-            await debug_send(update, f"Выбрано задание №{task_number} (ОГЭ)")
-        else:
-            await update.message.reply_text("Неизвестный уровень.")
-            return ConversationHandler.END
 
         task = await fetch_math_task(task_url, task_number, update)
         if not task:
@@ -365,7 +345,6 @@ async def level_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         user_id = update.effective_user.id
         user_tasks[user_id] = {"correct_answer": correct_answer}
 
-        # Стилизованная отправка
         await update.message.reply_text(
             f"📘 *Задание {task_number} ({subject}, {level_name})*\n\n⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯\n\n{task['text']}",
             parse_mode="Markdown"
@@ -378,16 +357,15 @@ async def level_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text("✍️ Введи свой ответ (только число/набор цифр без пробелов):")
         return WAITING_ANSWER
 
-    # ----- Русский язык -----
+    # Русский язык
     elif subject == "Русский язык":
         if level_code != "ege":
-            await update.message.reply_text("Для русского языка пока доступен только уровень ЕГЭ.")
+            await update.message.reply_text("Для русского языка пока доступен только ЕГЭ.")
             return ConversationHandler.END
 
         task_number = random.randint(1, 26)
         task_url = RUS_EGE_TEST_URL
         correct_answers = RUS_EGE_CORRECT_ANSWERS
-        await debug_send(update, f"Выбрано задание №{task_number} (Русский язык, ЕГЭ)")
 
         task = await fetch_russian_task(task_url, task_number, update)
         if not task:
@@ -396,29 +374,17 @@ async def level_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
         correct_answer = correct_answers.get(task_number)
         if not correct_answer:
-            await update.message.reply_text("Нет правильного ответа для этого задания. Попробуйте другое /start")
+            await update.message.reply_text("Нет правильного ответа. Попробуйте другое /start")
             return ConversationHandler.END
 
         user_id = update.effective_user.id
         user_tasks[user_id] = {"correct_answer": correct_answer}
 
-        await debug_send(update, f"Начинаем отправку текста (длина {len(task['text'])} символов)")
-        try:
-            await send_long_text(update, task['text'], f"📖 *Задание {task_number} ({subject}, ЕГЭ)*")
-            await debug_send(update, "Текст успешно отправлен")
-        except Exception as e:
-            await debug_send(update, f"Ошибка при отправке текста: {e}")
-            await send_long_text(update, task['text'], f"Задание {task_number}")
-
+        await send_long_text(update, task['text'], f"📖 *Задание {task_number} ({subject}, ЕГЭ)*")
         if task["images"]:
-            await debug_send(update, f"Всего изображений: {len(task['images'])}")
             await update.message.reply_text("📎 Пояснение к заданию (изображения ниже):")
-            for i, img_io in enumerate(task["images"]):
-                await debug_send(update, f"Отправка изображения {i+1}/{len(task['images'])}...")
+            for img_io in task["images"]:
                 await send_image(update, img_io)
-                await debug_send(update, f"Изображение {i+1} отправлено")
-        else:
-            await debug_send(update, "Нет изображений для отправки")
 
         await update.message.reply_text("✍️ Введи свой ответ (слово, число или последовательность цифр без пробелов):")
         return WAITING_ANSWER
@@ -428,7 +394,6 @@ async def level_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return ConversationHandler.END
 
 async def check_answer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Проверка ответа пользователя и предложение действий."""
     user_id = update.effective_user.id
     user_data = user_tasks.get(user_id)
     if not user_data:
@@ -436,7 +401,6 @@ async def check_answer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         return ConversationHandler.END
     user_answer = update.message.text.strip()
     correct_answer = user_data["correct_answer"]
-    await debug_send(update, f"Ответ пользователя: '{user_answer}', правильный: '{correct_answer}'")
 
     reply_keyboard = [['✅ Решить ещё раз'], ['🏠 Главное меню']]
     markup = ReplyKeyboardMarkup(reply_keyboard, one_time_keyboard=False, resize_keyboard=True)
@@ -475,6 +439,26 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         parse_mode="Markdown"
     )
 
+# ---------- Обработчик кнопок вне диалога ----------
+async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text = update.message.text
+    if text == '🏠 Главное меню':
+        context.user_data.clear()
+        await start(update, context)
+    elif text == '✅ Решить ещё раз':
+        subject = context.user_data.get("last_subject")
+        level = context.user_data.get("last_level")
+        if subject and level:
+            context.user_data["auto_resume"] = True
+            await start(update, context)
+        else:
+            await start(update, context)
+    else:
+        # Неизвестная команда – предложим /start
+        await update.message.reply_text(
+            "❓ Я не понял запрос.\nИспользуй /start, чтобы начать новый диалог."
+        )
+
 def main() -> None:
     TOKEN = os.environ.get("TELEGRAM_TOKEN")
     if not TOKEN:
@@ -492,7 +476,10 @@ def main() -> None:
     )
 
     application.add_handler(conv_handler)
+    # Обработчик кнопок вне диалога (после conv_handler)
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, menu_handler))
     application.add_handler(CommandHandler("help", help_command))
+
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
