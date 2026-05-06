@@ -299,27 +299,45 @@ async def fetch_russian_task(problem_id: int, update: Update) -> Optional[Dict]:
                     return None
                 html = await resp.text()
                 soup = BeautifulSoup(html, "html.parser")
-                # Находим блок с условием задания
+                
+                # Находим блок с заданием (несколько способов)
                 prob_view = soup.find("div", class_="prob_view")
                 if not prob_view:
-                    await debug_send(update, "Не найден prob_view")
-                    return None
+                    # Пробуем найти через CSS-селектор
+                    prob_view = soup.select_one("div.prob_view")
+                if not prob_view:
+                    # Ищем любой div с классом, содержащим "prob"
+                    prob_view = soup.find("div", class_=re.compile(r"prob"))
+                if not prob_view:
+                    # Прямой поиск pbody
+                    pbody = soup.find("div", class_="pbody")
+                    if pbody:
+                        prob_view = pbody.parent
+                    else:
+                        await debug_send(update, "Не найден prob_view или pbody")
+                        return None
+                
+                # Теперь ищем pbody внутри prob_view
                 pbody = prob_view.find("div", class_="pbody")
                 if not pbody:
-                    await debug_send(update, "Не найден pbody")
-                    return None
+                    # Может быть, pbody — это сам prob_view?
+                    pbody = prob_view
+                
                 # Очистка от лишних пояснений
                 cleaned_pbody = clean_task_soup(pbody)
                 original_html = str(cleaned_pbody)
                 first_html = get_first_subquestion_html(original_html)
                 first_soup = BeautifulSoup(first_html, "html.parser")
+                
                 img_urls = extract_image_urls_from_soup(first_soup, url)
                 images_io = []
                 for img_url in img_urls:
                     img_data = await download_image(session, img_url, referer=url)
                     if img_data:
                         images_io.append(img_data)
+                
                 task_text = format_html_to_text(first_html)
+                await debug_send(update, f"Русский: текст получен ({len(task_text)} символов), изображений: {len(images_io)}")
                 return {"text": task_text, "images": images_io}
         except Exception as e:
             logger.error(f"Russian error: {e}")
