@@ -25,7 +25,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-SUBJECT, LEVEL, WAITING_ANSWER = range(3)
+SUBJECT, LEVEL, WAITING_ANSWER, ACTION = range(4)
 
 SUBJECTS = {
     "Математика": {"ege": 2, "oge": 2},
@@ -249,18 +249,6 @@ async def fetch_russian_task(test_url: str, task_number: int, update: Update) ->
 
 # ---------- Обработчики диалога ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    # Если есть автоматическое возобновление (после нажатия "Решить ещё раз")
-    if context.user_data.get("auto_resume"):
-        subject = context.user_data.get("last_subject")
-        level = context.user_data.get("last_level")
-        if subject and level:
-            context.user_data["subject"] = subject
-            context.user_data["auto_resume"] = False
-            update.message.text = level
-            return await level_selected(update, context)
-        else:
-            context.user_data["auto_resume"] = False
-    # Обычное начало
     reply_keyboard = [[subject] for subject in SUBJECTS.keys()]
     await update.message.reply_text(
         "📚 *Добро пожаловать в бот для подготовки к ЕГЭ/ОГЭ!*\n\n"
@@ -274,20 +262,21 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 async def subject_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     text = update.message.text
     if text == '🏠 Главное меню':
-        context.user_data.clear()
         return await start(update, context)
     if text == '✅ Решить ещё раз':
+        # Повтор последнего задания
         subject = context.user_data.get("last_subject")
         level = context.user_data.get("last_level")
         if subject and level:
             context.user_data["subject"] = subject
+            # Прямой вызов level_selected с нужным уровнем
             update.message.text = level
             return await level_selected(update, context)
         else:
             return await start(update, context)
 
     if text not in SUBJECTS:
-        await update.message.reply_text("Пожалуйста, выбери предмет из списка.")
+        await update.message.reply_text("Пожалуйста, выбери предмет из списка.", reply_markup=ReplyKeyboardMarkup([[s] for s in SUBJECTS.keys()], one_time_keyboard=True))
         return SUBJECT
     context.user_data["subject"] = text
     reply_keyboard = [[level] for level in LEVELS.keys()]
@@ -300,7 +289,6 @@ async def subject_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 async def level_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     level_name = update.message.text
     if level_name == '🏠 Главное меню':
-        context.user_data.clear()
         return await start(update, context)
     if level_name == '✅ Решить ещё раз':
         subject = context.user_data.get("last_subject")
@@ -313,11 +301,11 @@ async def level_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             return await start(update, context)
 
     if level_name not in LEVELS:
-        await update.message.reply_text("Пожалуйста, выбери уровень из списка.")
+        await update.message.reply_text("Пожалуйста, выбери уровень из списка.", reply_markup=ReplyKeyboardMarkup([[l] for l in LEVELS.keys()], one_time_keyboard=True))
         return LEVEL
+
     subject = context.user_data.get("subject")
     level_code = LEVELS[level_name]
-
     context.user_data["last_subject"] = subject
     context.user_data["last_level"] = level_name
 
@@ -374,7 +362,7 @@ async def level_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
         correct_answer = correct_answers.get(task_number)
         if not correct_answer:
-            await update.message.reply_text("Нет правильного ответа. Попробуйте другое /start")
+            await update.message.reply_text("Нет правильного ответа для этого задания. Попробуйте другое /start")
             return ConversationHandler.END
 
         user_id = update.effective_user.id
@@ -399,27 +387,52 @@ async def check_answer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     if not user_data:
         await update.message.reply_text("Что-то пошло не так. Начнём заново? /start")
         return ConversationHandler.END
+
     user_answer = update.message.text.strip()
     correct_answer = user_data["correct_answer"]
 
-    reply_keyboard = [['✅ Решить ещё раз'], ['🏠 Главное меню']]
-    markup = ReplyKeyboardMarkup(reply_keyboard, one_time_keyboard=False, resize_keyboard=True)
+    action_keyboard = [['✅ Решить ещё раз'], ['🏠 Главное меню']]
+    action_markup = ReplyKeyboardMarkup(action_keyboard, one_time_keyboard=False, resize_keyboard=True)
 
     if user_answer == correct_answer:
         await update.message.reply_text(
             "✅ *Правильно! Молодец!*\n\nЧто хочешь сделать дальше?",
             parse_mode="Markdown",
-            reply_markup=markup
+            reply_markup=action_markup
         )
     else:
         await update.message.reply_text(
             f"❌ *Неправильно.*\nПравильный ответ: `{correct_answer}`\n\nЧто хочешь сделать дальше?",
             parse_mode="Markdown",
-            reply_markup=markup
+            reply_markup=action_markup
         )
 
     user_tasks.pop(user_id, None)
-    return ConversationHandler.END
+    return ACTION
+
+async def action_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text
+    if text == '✅ Решить ещё раз':
+        subject = context.user_data.get("last_subject")
+        level = context.user_data.get("last_level")
+        if subject and level:
+            context.user_data["subject"] = subject
+            # Повторяем выбор уровня
+            update.message.text = level
+            return await level_selected(update, context)
+        else:
+            return await start(update, context)
+    elif text == '🏠 Главное меню':
+        return await start(update, context)
+    else:
+        # Если пользователь ввёл что-то другое – повторяем предложение
+        action_keyboard = [['✅ Решить ещё раз'], ['🏠 Главное меню']]
+        action_markup = ReplyKeyboardMarkup(action_keyboard, one_time_keyboard=False, resize_keyboard=True)
+        await update.message.reply_text(
+            "Пожалуйста, выбери действие с помощью кнопок:",
+            reply_markup=action_markup
+        )
+        return ACTION
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.message.reply_text("Диалог прерван. Чтобы начать заново, отправь /start")
@@ -439,26 +452,6 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         parse_mode="Markdown"
     )
 
-# ---------- Обработчик кнопок вне диалога ----------
-async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    text = update.message.text
-    if text == '🏠 Главное меню':
-        context.user_data.clear()
-        await start(update, context)
-    elif text == '✅ Решить ещё раз':
-        subject = context.user_data.get("last_subject")
-        level = context.user_data.get("last_level")
-        if subject and level:
-            context.user_data["auto_resume"] = True
-            await start(update, context)
-        else:
-            await start(update, context)
-    else:
-        # Неизвестная команда – предложим /start
-        await update.message.reply_text(
-            "❓ Я не понял запрос.\nИспользуй /start, чтобы начать новый диалог."
-        )
-
 def main() -> None:
     TOKEN = os.environ.get("TELEGRAM_TOKEN")
     if not TOKEN:
@@ -471,15 +464,13 @@ def main() -> None:
             SUBJECT: [MessageHandler(filters.TEXT & ~filters.COMMAND, subject_selected)],
             LEVEL: [MessageHandler(filters.TEXT & ~filters.COMMAND, level_selected)],
             WAITING_ANSWER: [MessageHandler(filters.TEXT & ~filters.COMMAND, check_answer)],
+            ACTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, action_handler)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
 
     application.add_handler(conv_handler)
-    # Обработчик кнопок вне диалога (после conv_handler)
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, menu_handler))
     application.add_handler(CommandHandler("help", help_command))
-
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
