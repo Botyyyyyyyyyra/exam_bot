@@ -3,7 +3,7 @@ import logging
 import os
 import random
 import re
-from typing import Dict, Optional, List
+from typing import Dict, Optional
 from io import BytesIO
 
 import aiohttp
@@ -73,12 +73,11 @@ async def debug_send(update: Update, text: str):
             pass
 
 async def send_long_text(update: Update, text: str, prefix: str = ""):
-    """Разбивает длинный текст на части и отправляет."""
+    """Разбивает длинный текст на части с разделителем."""
     MAX_LEN = 4096
     if len(text) <= MAX_LEN:
-        await update.message.reply_text(f"{prefix}{text}", parse_mode="Markdown")
+        await update.message.reply_text(f"{prefix}\n\n⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯\n\n{text}", parse_mode="Markdown")
         return
-    # Разбиваем по предложениям или по границе слов
     parts = []
     current = ""
     for line in text.split('\n'):
@@ -90,8 +89,21 @@ async def send_long_text(update: Update, text: str, prefix: str = ""):
     if current:
         parts.append(current)
     for i, part in enumerate(parts, 1):
-        header = f"{prefix} (часть {i}/{len(parts)})\n\n" if len(parts) > 1 else prefix
+        header = f"{prefix} (часть {i}/{len(parts)})\n\n⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯\n\n" if len(parts) > 1 else f"{prefix}\n\n⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯\n\n"
         await update.message.reply_text(f"{header}{part}", parse_mode="Markdown")
+
+def get_image_extension(data: bytes) -> str:
+    if data[:4] == b'\x89PNG':
+        return '.png'
+    if data[:2] == b'\xff\xd8':
+        return '.jpg'
+    if data[:6] in (b'GIF87a', b'GIF89a'):
+        return '.gif'
+    if data[:4] == b'RIFF' and data[8:12] == b'WEBP':
+        return '.webp'
+    if data.startswith(b'<svg') or b'<svg' in data[:100]:
+        return '.svg'
+    return '.bin'
 
 async def download_image(session: aiohttp.ClientSession, url: str, referer: str) -> Optional[BytesIO]:
     headers = {
@@ -99,15 +111,37 @@ async def download_image(session: aiohttp.ClientSession, url: str, referer: str)
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
     }
     try:
-        async with session.get(url, timeout=10, headers=headers) as resp:
-            if resp.status == 200:
-                data = await resp.read()
-                if len(data) <= 10 * 1024 * 1024:
-                    return BytesIO(data)
-            return None
+        async with session.get(url, timeout=15, headers=headers) as resp:
+            if resp.status != 200:
+                logger.warning(f"Image download HTTP {resp.status} for {url}")
+                return None
+            data = await resp.read()
+            if not data:
+                logger.warning(f"Empty image data for {url}")
+                return None
+            if len(data) > 10 * 1024 * 1024:
+                logger.warning(f"Image too large: {len(data)} bytes for {url}")
+                return None
+            return BytesIO(data)
     except Exception as e:
-        logger.error(f"Image download error: {e}")
+        logger.error(f"Image download error for {url}: {e}")
         return None
+
+async def send_image(update: Update, image_bytes: BytesIO) -> bool:
+    """Отправляет изображение как документ с правильным расширением."""
+    try:
+        image_bytes.seek(0)
+        data = image_bytes.read()
+        if not data:
+            return False
+        ext = get_image_extension(data)
+        filename = f"image{ext}"
+        image_bytes.seek(0)
+        await update.message.reply_document(document=image_bytes, filename=filename)
+        return True
+    except Exception as e:
+        logger.error(f"Send document failed: {e}")
+        return False
 
 def extract_image_urls_from_soup(soup, base_url: str) -> list:
     urls = []
@@ -150,27 +184,6 @@ def format_html_to_text(html_content: str) -> str:
     text = soup.get_text()
     text = re.sub(r'\n\s*\n', '\n\n', text)
     return text.strip()
-
-async def send_image(update: Update, image_bytes: BytesIO) -> bool:
-    await debug_send(update, "send_image: начало")
-    image_bytes.seek(0)
-    header = image_bytes.read(10)
-    image_bytes.seek(0)
-    is_svg = (header.startswith(b'<svg') or b'<svg' in header)
-    if is_svg:
-        await update.message.reply_document(document=image_bytes, filename="image.svg")
-        await update.message.reply_text("⚠️ Изображение отправлено как файл (SVG).")
-        return False
-    try:
-        await update.message.reply_photo(photo=image_bytes)
-        return True
-    except Exception as e:
-        logger.error(f"Photo send failed: {e}")
-        await debug_send(update, f"send_image: ошибка при отправке фото: {e}")
-        image_bytes.seek(0)
-        await update.message.reply_document(document=image_bytes, filename="image.png")
-        await update.message.reply_text("⚠️ Изображение отправлено как файл.")
-        return False
 
 # ---------- Парсинг заданий ----------
 async def fetch_math_task(test_url: str, task_number: int, update: Update) -> Optional[Dict]:
@@ -261,35 +274,69 @@ async def fetch_russian_task(test_url: str, task_number: int, update: Update) ->
 
 # ---------- Обработчики ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Приветствие и главное меню."""
     reply_keyboard = [[subject] for subject in SUBJECTS.keys()]
     await update.message.reply_text(
-        "Привет! Я помогу тебе подготовиться к ЕГЭ/ОГЭ.\nВыбери предмет:",
+        "📚 *Добро пожаловать в бот для подготовки к ЕГЭ/ОГЭ!*\n\n"
+        "Я умею присылать реальные задания с сайта Решу ЕГЭ/ОГЭ.\n"
+        "Выбери предмет:",
         reply_markup=ReplyKeyboardMarkup(reply_keyboard, one_time_keyboard=True),
+        parse_mode="Markdown"
     )
     return SUBJECT
 
 async def subject_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    subject = update.message.text
-    if subject not in SUBJECTS:
+    """Обработка выбора предмета."""
+    text = update.message.text
+    if text == '🏠 Главное меню':
+        return await start(update, context)
+    if text == '✅ Решить ещё раз':
+        subject = context.user_data.get("last_subject")
+        level = context.user_data.get("last_level")
+        if subject and level:
+            context.user_data["subject"] = subject
+            update.message.text = level
+            return await level_selected(update, context)
+        else:
+            return await start(update, context)
+
+    if text not in SUBJECTS:
         await update.message.reply_text("Пожалуйста, выбери предмет из списка.")
         return SUBJECT
-    context.user_data["subject"] = subject
+    context.user_data["subject"] = text
     reply_keyboard = [[level] for level in LEVELS.keys()]
     await update.message.reply_text(
-        f"Отлично! Предмет: {subject}\nТеперь выбери уровень:",
+        f"Отлично! Предмет: {text}\nТеперь выбери уровень:",
         reply_markup=ReplyKeyboardMarkup(reply_keyboard, one_time_keyboard=True),
     )
     return LEVEL
 
 async def level_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Обработка выбора уровня и отправка задания."""
     level_name = update.message.text
+    if level_name == '🏠 Главное меню':
+        return await start(update, context)
+    if level_name == '✅ Решить ещё раз':
+        subject = context.user_data.get("last_subject")
+        level = context.user_data.get("last_level")
+        if subject and level:
+            context.user_data["subject"] = subject
+            update.message.text = level
+            return await level_selected(update, context)
+        else:
+            return await start(update, context)
+
     if level_name not in LEVELS:
         await update.message.reply_text("Пожалуйста, выбери уровень из списка.")
         return LEVEL
     subject = context.user_data.get("subject")
     level_code = LEVELS[level_name]
 
-    # ----- Математика (без изменений) -----
+    # Сохраняем последний выбор для кнопки "Решить ещё раз"
+    context.user_data["last_subject"] = subject
+    context.user_data["last_level"] = level_name
+
+    # ----- Математика -----
     if subject == "Математика":
         if level_code == "ege":
             task_number = random.randint(1, 21)
@@ -318,23 +365,20 @@ async def level_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         user_id = update.effective_user.id
         user_tasks[user_id] = {"correct_answer": correct_answer}
 
+        # Стилизованная отправка
         await update.message.reply_text(
-            f"📘 *Задание {task_number} ({subject}, {level_name})*\n\n{task['text']}",
+            f"📘 *Задание {task_number} ({subject}, {level_name})*\n\n⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯\n\n{task['text']}",
             parse_mode="Markdown"
         )
         if task["images"]:
-            await update.message.reply_text("📎 Пояснение к заданию (см. изображения ниже):")
+            await update.message.reply_text("📎 Пояснение к заданию (изображения ниже):")
             for img_io in task["images"]:
                 await send_image(update, img_io)
-        elif task.get("image_urls"):
-            await update.message.reply_text("📎 Изображения к заданию (ссылки):")
-            for url in task["image_urls"]:
-                await update.message.reply_text(f"• {url}")
 
         await update.message.reply_text("✍️ Введи свой ответ (только число/набор цифр без пробелов):")
         return WAITING_ANSWER
 
-    # ----- Русский язык (с разбивкой длинного текста) -----
+    # ----- Русский язык -----
     elif subject == "Русский язык":
         if level_code != "ege":
             await update.message.reply_text("Для русского языка пока доступен только уровень ЕГЭ.")
@@ -358,20 +402,17 @@ async def level_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         user_id = update.effective_user.id
         user_tasks[user_id] = {"correct_answer": correct_answer}
 
-        # Отправка текста с разбивкой на части
         await debug_send(update, f"Начинаем отправку текста (длина {len(task['text'])} символов)")
         try:
-            await send_long_text(update, task['text'], f"📖 *Задание {task_number} ({subject}, ЕГЭ)*\n\n")
+            await send_long_text(update, task['text'], f"📖 *Задание {task_number} ({subject}, ЕГЭ)*")
             await debug_send(update, "Текст успешно отправлен")
         except Exception as e:
             await debug_send(update, f"Ошибка при отправке текста: {e}")
-            # fallback: отправить без Markdown, но с разбивкой
-            await send_long_text(update, task['text'], f"Задание {task_number}\n\n")
+            await send_long_text(update, task['text'], f"Задание {task_number}")
 
-        # Отправка изображений
         if task["images"]:
             await debug_send(update, f"Всего изображений: {len(task['images'])}")
-            await update.message.reply_text("📎 Пояснение к заданию (см. изображения ниже):")
+            await update.message.reply_text("📎 Пояснение к заданию (изображения ниже):")
             for i, img_io in enumerate(task["images"]):
                 await debug_send(update, f"Отправка изображения {i+1}/{len(task['images'])}...")
                 await send_image(update, img_io)
@@ -387,6 +428,7 @@ async def level_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return ConversationHandler.END
 
 async def check_answer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Проверка ответа пользователя и предложение действий."""
     user_id = update.effective_user.id
     user_data = user_tasks.get(user_id)
     if not user_data:
@@ -395,13 +437,23 @@ async def check_answer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     user_answer = update.message.text.strip()
     correct_answer = user_data["correct_answer"]
     await debug_send(update, f"Ответ пользователя: '{user_answer}', правильный: '{correct_answer}'")
+
+    reply_keyboard = [['✅ Решить ещё раз'], ['🏠 Главное меню']]
+    markup = ReplyKeyboardMarkup(reply_keyboard, one_time_keyboard=False, resize_keyboard=True)
+
     if user_answer == correct_answer:
-        await update.message.reply_text("✅ Правильно! Молодец!\n\nХочешь решить ещё одно? /start")
+        await update.message.reply_text(
+            "✅ *Правильно! Молодец!*\n\nЧто хочешь сделать дальше?",
+            parse_mode="Markdown",
+            reply_markup=markup
+        )
     else:
         await update.message.reply_text(
-            f"❌ Неправильно.\nПравильный ответ: `{correct_answer}`\n\nПопробуй ещё раз? /start",
-            parse_mode="Markdown"
+            f"❌ *Неправильно.*\nПравильный ответ: `{correct_answer}`\n\nЧто хочешь сделать дальше?",
+            parse_mode="Markdown",
+            reply_markup=markup
         )
+
     user_tasks.pop(user_id, None)
     return ConversationHandler.END
 
@@ -411,12 +463,16 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "Я присылаю задания из вариантов:\n"
+        "📘 *Справка*\n\n"
+        "Я присылаю задания из реальных вариантов:\n"
         "- Математика ЕГЭ (база) №21621325 (задания 1–21)\n"
         "- Математика ОГЭ №79386761 (задания 1–19)\n"
-        "- Русский язык ЕГЭ №55373666 (задания 1–26)\n"
-        "Напиши /start и выбери предмет и уровень.\n"
-        "В ответ вводи число, комбинацию цифр или слово без пробелов."
+        "- Русский язык ЕГЭ №55373666 (задания 1–26)\n\n"
+        "Управление:\n"
+        "• /start – начать диалог\n"
+        "• /help – эта справка\n"
+        "• после ответа используй кнопки «Решить ещё раз» или «Главное меню»",
+        parse_mode="Markdown"
     )
 
 def main() -> None:
@@ -424,6 +480,7 @@ def main() -> None:
     if not TOKEN:
         raise ValueError("Токен не задан")
     application = Application.builder().token(TOKEN).build()
+
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
@@ -433,6 +490,7 @@ def main() -> None:
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
+
     application.add_handler(conv_handler)
     application.add_handler(CommandHandler("help", help_command))
     application.run_polling(allowed_updates=Update.ALL_TYPES)
