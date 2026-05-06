@@ -29,7 +29,7 @@ SUBJECT, LEVEL, WAITING_ANSWER = range(3)
 
 SUBJECTS = {
     "Математика": {"ege": 2, "oge": 2},
-    "Русский язык": {"ege": 1, "oge": 1},   # уровень ОГЭ пока не реализован
+    "Русский язык": {"ege": 1, "oge": 1},
 }
 LEVELS = {"ЕГЭ": "ege", "ОГЭ": "oge"}
 
@@ -50,10 +50,9 @@ CORRECT_ANSWERS_OGE = {
     18: "14", 19: "123",
 }
 
-# ===== Русский язык (ЕГЭ) – аналогично математике =====
+# ===== Русский язык =====
 RUS_EGE_TEST_ID = 55373666
 RUS_EGE_TEST_URL = f"https://rus-ege.sdamgia.ru/test?id={RUS_EGE_TEST_ID}"
-# Правильные ответы для заданий 1–26 из этого варианта (получены из предоставленного HTML)
 RUS_EGE_CORRECT_ANSWERS = {
     1: "таккак", 2: "24", 3: "345", 4: "125", 5: "двойственное",
     6: "черном", 7: "разожжёт", 8: "81635", 9: "23", 10: "45",
@@ -63,10 +62,9 @@ RUS_EGE_CORRECT_ANSWERS = {
     26: "31",
 }
 
-# Хранилище для правильных ответов пользователей
 user_tasks: Dict[int, Dict] = {}
 
-# ---------- Вспомогательные функции (не менялись) ----------
+# ---------- Вспомогательные функции ----------
 async def debug_send(update: Update, text: str):
     if DEBUG:
         try:
@@ -133,25 +131,33 @@ def format_html_to_text(html_content: str) -> str:
     return text.strip()
 
 async def send_image(update: Update, image_bytes: BytesIO) -> bool:
+    """Отправляет изображение с подробным логированием."""
+    await debug_send(update, "send_image: начало")
     image_bytes.seek(0)
     header = image_bytes.read(10)
     image_bytes.seek(0)
+    await debug_send(update, f"send_image: первые 10 байт: {header[:10]}")
     is_svg = (header.startswith(b'<svg') or b'<svg' in header)
     if is_svg:
+        await debug_send(update, "send_image: определён SVG, отправляем как документ")
         await update.message.reply_document(document=image_bytes, filename="image.svg")
         await update.message.reply_text("⚠️ Изображение отправлено как файл (SVG).")
         return False
     try:
+        await debug_send(update, "send_image: пробуем отправить как фото")
         await update.message.reply_photo(photo=image_bytes)
+        await debug_send(update, "send_image: фото отправлено успешно")
         return True
     except Exception as e:
         logger.error(f"Photo send failed: {e}")
+        await debug_send(update, f"send_image: ошибка при отправке фото: {e}")
         image_bytes.seek(0)
+        await debug_send(update, "send_image: пробуем отправить как документ")
         await update.message.reply_document(document=image_bytes, filename="image.png")
         await update.message.reply_text("⚠️ Изображение отправлено как файл.")
         return False
 
-# ---------- Парсинг заданий (математика) ----------
+# ---------- Парсинг заданий ----------
 async def fetch_math_task(test_url: str, task_number: int, update: Update) -> Optional[Dict]:
     async with aiohttp.ClientSession() as session:
         try:
@@ -192,13 +198,13 @@ async def fetch_math_task(test_url: str, task_number: int, update: Update) -> Op
             logger.error(f"Error: {e}")
             return None
 
-# ---------- Парсинг заданий (русский язык, полностью аналогично) ----------
 async def fetch_russian_task(test_url: str, task_number: int, update: Update) -> Optional[Dict]:
-    """Полностью копирует логику fetch_math_task, но для страницы рус-егэ."""
+    await debug_send(update, f"fetch_russian_task: начало загрузки задания №{task_number}")
     async with aiohttp.ClientSession() as session:
         try:
             async with session.get(test_url, timeout=15, headers={"User-Agent": "Mozilla/5.0"}) as resp:
                 if resp.status != 200:
+                    await debug_send(update, f"Ошибка HTTP {resp.status}")
                     return None
                 html = await resp.text()
                 soup = BeautifulSoup(html, "html.parser")
@@ -212,16 +218,17 @@ async def fetch_russian_task(test_url: str, task_number: int, update: Update) ->
                     return None
                 prob_view = prob_num_div.find_next_sibling("div", class_="prob_view")
                 if not prob_view:
+                    await debug_send(update, "Не найден prob_view")
                     return None
                 pbody = prob_view.find("div", class_="pbody")
                 if not pbody:
+                    await debug_send(update, "Не найден pbody")
                     return None
                 original_html = str(pbody)
-                # Для русского языка не нужно обрезать по "ИЛИ", но функция get_first_subquestion_html это делает.
-                # Оставляем как есть – она вернёт полный текст, если не найдёт "ИЛИ".
                 first_html = get_first_subquestion_html(original_html)
                 first_soup = BeautifulSoup(first_html, "html.parser")
                 img_urls = extract_image_urls_from_soup(first_soup, test_url)
+                await debug_send(update, f"Найдено URL изображений: {len(img_urls)}")
                 images_io = []
                 for url in img_urls:
                     img_data = await download_image(session, url, referer=test_url)
@@ -234,9 +241,10 @@ async def fetch_russian_task(test_url: str, task_number: int, update: Update) ->
                 return {"text": task_text, "images": images_io, "image_urls": img_urls}
         except Exception as e:
             logger.error(f"Russian task error: {e}")
+            await debug_send(update, f"Исключение в fetch_russian_task: {e}")
             return None
 
-# ---------- Обработчики диалога (не менялись, только добавлена ветка для русского) ----------
+# ---------- Обработчики ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     reply_keyboard = [[subject] for subject in SUBJECTS.keys()]
     await update.message.reply_text(
@@ -311,14 +319,13 @@ async def level_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text("✍️ Введи свой ответ (только число/набор цифр без пробелов):")
         return WAITING_ANSWER
 
-    # ----- Русский язык (новая ветка, полностью аналогична математике) -----
+    # ----- Русский язык (с расширенным логированием) -----
     elif subject == "Русский язык":
-        # Пока поддерживается только ЕГЭ
         if level_code != "ege":
             await update.message.reply_text("Для русского языка пока доступен только уровень ЕГЭ.")
             return ConversationHandler.END
 
-        task_number = random.randint(1, 26)   # в варианте 26 заданий
+        task_number = random.randint(1, 26)
         task_url = RUS_EGE_TEST_URL
         correct_answers = RUS_EGE_CORRECT_ANSWERS
         await debug_send(update, f"Выбрано задание №{task_number} (Русский язык, ЕГЭ)")
@@ -336,18 +343,29 @@ async def level_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         user_id = update.effective_user.id
         user_tasks[user_id] = {"correct_answer": correct_answer}
 
-        await update.message.reply_text(
-            f"📖 *Задание {task_number} ({subject}, ЕГЭ)*\n\n{task['text']}",
-            parse_mode="Markdown"
-        )
+        # Отправка текста задания
+        await debug_send(update, f"Начинаем отправку текста (длина {len(task['text'])} символов)")
+        try:
+            await update.message.reply_text(
+                f"📖 *Задание {task_number} ({subject}, ЕГЭ)*\n\n{task['text']}",
+                parse_mode="Markdown"
+            )
+            await debug_send(update, "Текст успешно отправлен")
+        except Exception as e:
+            await debug_send(update, f"Ошибка при отправке текста: {e}")
+            await update.message.reply_text(f"📖 *Задание {task_number}* (ошибка форматирования)\n\n{task['text']}")
+            await debug_send(update, "Текст отправлен без Markdown")
+
+        # Отправка изображений
         if task["images"]:
+            await debug_send(update, f"Всего изображений: {len(task['images'])}")
             await update.message.reply_text("📎 Пояснение к заданию (см. изображения ниже):")
-            for img_io in task["images"]:
+            for i, img_io in enumerate(task["images"]):
+                await debug_send(update, f"Отправка изображения {i+1}/{len(task['images'])}...")
                 await send_image(update, img_io)
-        elif task.get("image_urls"):
-            await update.message.reply_text("📎 Изображения к заданию (ссылки):")
-            for url in task["image_urls"]:
-                await update.message.reply_text(f"• {url}")
+                await debug_send(update, f"Изображение {i+1} отправлено")
+        else:
+            await debug_send(update, "Нет изображений для отправки")
 
         await update.message.reply_text("✍️ Введи свой ответ (слово, число или последовательность цифр без пробелов):")
         return WAITING_ANSWER
