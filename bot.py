@@ -72,8 +72,16 @@ async def debug_send(update: Update, text: str):
         except:
             pass
 
-async def delete_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Удаляет сообщения, сохранённые в context.user_data['bot_messages']."""
+async def delete_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Удаляет сообщение пользователя, если оно не является командой."""
+    if update.message and not update.message.text.startswith('/'):
+        try:
+            await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=update.message.message_id)
+        except Exception as e:
+            logger.debug(f"Не удалось удалить сообщение пользователя: {e}")
+
+async def delete_bot_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Удаляет все сохранённые сообщения бота."""
     bot_messages = context.user_data.get("bot_messages", [])
     for msg_id in bot_messages:
         try:
@@ -81,11 +89,13 @@ async def delete_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logger.debug(f"Не удалось удалить сообщение {msg_id}: {e}")
     context.user_data["bot_messages"] = []
-    # Также удаляем сообщение пользователя, если оно не удалено ранее
-    try:
-        await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=update.message.message_id)
-    except:
-        pass
+
+async def send_and_track(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, **kwargs) -> None:
+    """Отправляет сообщение и сохраняет его ID."""
+    msg = await update.message.reply_text(text, **kwargs)
+    bot_messages = context.user_data.get("bot_messages", [])
+    bot_messages.append(msg.message_id)
+    context.user_data["bot_messages"] = bot_messages
 
 async def send_long_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, prefix: str = ""):
     """Разбивает длинный текст на части и сохраняет ID отправленных сообщений."""
@@ -274,8 +284,10 @@ async def fetch_russian_task(test_url: str, task_number: int, update: Update) ->
 
 # ---------- Обработчики диалога ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    # Удаляем старые сообщения бота, если есть
-    await delete_messages(update, context)
+    # Удаляем все предыдущие сообщения бота
+    await delete_bot_messages(update, context)
+    # Удаляем сообщение пользователя, если это не команда /start
+    await delete_user_message(update, context)
     reply_keyboard = [[subject] for subject in SUBJECTS.keys()]
     msg = await update.message.reply_text(
         "📚 *Добро пожаловать в бот для подготовки к ЕГЭ/ОГЭ!*\n\n"
@@ -288,13 +300,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return SUBJECT
 
 async def subject_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    # Удаляем сообщение пользователя с выбором предмета
+    await delete_user_message(update, context)
     text = update.message.text
     if text == '🏠 Главное меню':
-        await delete_messages(update, context)
+        await delete_bot_messages(update, context)
         return await start(update, context)
 
     if text not in SUBJECTS:
-        await update.message.reply_text("Пожалуйста, выбери предмет из списка.", reply_markup=ReplyKeyboardMarkup([[s] for s in SUBJECTS.keys()], one_time_keyboard=True))
+        await send_and_track(update, context, "Пожалуйста, выбери предмет из списка.", reply_markup=ReplyKeyboardMarkup([[s] for s in SUBJECTS.keys()], one_time_keyboard=True))
         return SUBJECT
     context.user_data["subject"] = text
     reply_keyboard = [[level] for level in LEVELS.keys()]
@@ -308,13 +322,15 @@ async def subject_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     return LEVEL
 
 async def level_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    # Удаляем сообщение пользователя с выбором уровня
+    await delete_user_message(update, context)
     level_name = update.message.text
     if level_name == '🏠 Главное меню':
-        await delete_messages(update, context)
+        await delete_bot_messages(update, context)
         return await start(update, context)
 
     if level_name not in LEVELS:
-        await update.message.reply_text("Пожалуйста, выбери уровень из списка.", reply_markup=ReplyKeyboardMarkup([[l] for l in LEVELS.keys()], one_time_keyboard=True))
+        await send_and_track(update, context, "Пожалуйста, выбери уровень из списка.", reply_markup=ReplyKeyboardMarkup([[l] for l in LEVELS.keys()], one_time_keyboard=True))
         return LEVEL
 
     subject = context.user_data.get("subject")
@@ -333,46 +349,32 @@ async def level_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
         task = await fetch_math_task(task_url, task_number, update)
         if not task:
-            msg = await update.message.reply_text("Не удалось загрузить задание. Попробуйте позже.")
-            bot_messages = context.user_data.get("bot_messages", [])
-            bot_messages.append(msg.message_id)
-            context.user_data["bot_messages"] = bot_messages
+            await send_and_track(update, context, "Не удалось загрузить задание. Попробуйте позже.")
             return ConversationHandler.END
 
         correct_answer = correct_answers.get(task_number)
         if not correct_answer:
-            msg = await update.message.reply_text("Нет правильного ответа для этого задания. Попробуйте другое /start")
-            bot_messages = context.user_data.get("bot_messages", [])
-            bot_messages.append(msg.message_id)
-            context.user_data["bot_messages"] = bot_messages
+            await send_and_track(update, context, "Нет правильного ответа для этого задания. Попробуйте другое /start")
             return ConversationHandler.END
 
         user_id = update.effective_user.id
         user_tasks[user_id] = {"correct_answer": correct_answer}
 
-        msg = await update.message.reply_text(
+        await send_and_track(update, context,
             f"📘 *Задание {task_number} ({subject}, {level_name})*\n\n⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯\n\n{task['text']}",
             parse_mode="Markdown"
         )
-        bot_messages = context.user_data.get("bot_messages", [])
-        bot_messages.append(msg.message_id)
         if task["images"]:
-            caption_msg = await update.message.reply_text("📎 Пояснение к заданию (изображения ниже):")
-            bot_messages.append(caption_msg.message_id)
+            await send_and_track(update, context, "📎 Пояснение к заданию (изображения ниже):")
             for img_io in task["images"]:
                 await send_image(update, context, img_io)
-        request_msg = await update.message.reply_text("✍️ Введи свой ответ (только число/набор цифр без пробелов):")
-        bot_messages.append(request_msg.message_id)
-        context.user_data["bot_messages"] = bot_messages
+        await send_and_track(update, context, "✍️ Введи свой ответ (только число/набор цифр без пробелов):")
         return WAITING_ANSWER
 
     # Русский язык
     elif subject == "Русский язык":
         if level_code != "ege":
-            msg = await update.message.reply_text("Для русского языка пока доступен только ЕГЭ.")
-            bot_messages = context.user_data.get("bot_messages", [])
-            bot_messages.append(msg.message_id)
-            context.user_data["bot_messages"] = bot_messages
+            await send_and_track(update, context, "Для русского языка пока доступен только ЕГЭ.")
             return ConversationHandler.END
 
         task_number = random.randint(1, 26)
@@ -381,18 +383,12 @@ async def level_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
         task = await fetch_russian_task(task_url, task_number, update)
         if not task:
-            msg = await update.message.reply_text("Не удалось загрузить задание. Попробуйте позже.")
-            bot_messages = context.user_data.get("bot_messages", [])
-            bot_messages.append(msg.message_id)
-            context.user_data["bot_messages"] = bot_messages
+            await send_and_track(update, context, "Не удалось загрузить задание. Попробуйте позже.")
             return ConversationHandler.END
 
         correct_answer = correct_answers.get(task_number)
         if not correct_answer:
-            msg = await update.message.reply_text("Нет правильного ответа для этого задания. Попробуйте другое /start")
-            bot_messages = context.user_data.get("bot_messages", [])
-            bot_messages.append(msg.message_id)
-            context.user_data["bot_messages"] = bot_messages
+            await send_and_track(update, context, "Нет правильного ответа для этого задания. Попробуйте другое /start")
             return ConversationHandler.END
 
         user_id = update.effective_user.id
@@ -400,83 +396,67 @@ async def level_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
         await send_long_text(update, context, task['text'], f"📖 *Задание {task_number} ({subject}, ЕГЭ)*")
         if task["images"]:
-            caption_msg = await update.message.reply_text("📎 Пояснение к заданию (изображения ниже):")
-            bot_messages = context.user_data.get("bot_messages", [])
-            bot_messages.append(caption_msg.message_id)
-            context.user_data["bot_messages"] = bot_messages
+            await send_and_track(update, context, "📎 Пояснение к заданию (изображения ниже):")
             for img_io in task["images"]:
                 await send_image(update, context, img_io)
-        request_msg = await update.message.reply_text("✍️ Введи свой ответ (слово, число или последовательность цифр без пробелов):")
-        bot_messages = context.user_data.get("bot_messages", [])
-        bot_messages.append(request_msg.message_id)
-        context.user_data["bot_messages"] = bot_messages
+        await send_and_track(update, context, "✍️ Введи свой ответ (слово, число или последовательность цифр без пробелов):")
         return WAITING_ANSWER
 
     else:
-        msg = await update.message.reply_text("Предмет пока не поддерживается. Выберите Математику или Русский язык.")
-        bot_messages = context.user_data.get("bot_messages", [])
-        bot_messages.append(msg.message_id)
-        context.user_data["bot_messages"] = bot_messages
+        await send_and_track(update, context, "Предмет пока не поддерживается. Выберите Математику или Русский язык.")
         return ConversationHandler.END
 
 async def check_answer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user_id = update.effective_user.id
     user_data = user_tasks.get(user_id)
     if not user_data:
-        await update.message.reply_text("Что-то пошло не так. Начнём заново? /start")
+        await send_and_track(update, context, "Что-то пошло не так. Начнём заново? /start")
         return ConversationHandler.END
 
     user_answer = update.message.text.strip()
     correct_answer = user_data["correct_answer"]
 
+    # Удаляем сообщение пользователя с ответом
+    await delete_user_message(update, context)
+
     action_keyboard = [['🏠 Главное меню']]
     action_markup = ReplyKeyboardMarkup(action_keyboard, one_time_keyboard=False, resize_keyboard=True)
 
-    # Удаляем сообщение пользователя с ответом
-    try:
-        await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=update.message.message_id)
-    except:
-        pass
-
     if user_answer == correct_answer:
-        msg = await update.message.reply_text(
+        await send_and_track(update, context,
             "✅ *Правильно! Молодец!*\n\nЧто хочешь сделать дальше?",
             parse_mode="Markdown",
             reply_markup=action_markup
         )
     else:
-        msg = await update.message.reply_text(
+        await send_and_track(update, context,
             f"❌ *Неправильно.*\nПравильный ответ: `{correct_answer}`\n\nЧто хочешь сделать дальше?",
             parse_mode="Markdown",
             reply_markup=action_markup
         )
 
-    bot_messages = context.user_data.get("bot_messages", [])
-    bot_messages.append(msg.message_id)
-    context.user_data["bot_messages"] = bot_messages
     user_tasks.pop(user_id, None)
     return ACTION
 
 async def action_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    # Удаляем сообщение пользователя с нажатием кнопки
+    await delete_user_message(update, context)
     text = update.message.text
     if text == '🏠 Главное меню':
-        await delete_messages(update, context)
+        await delete_bot_messages(update, context)
         return await start(update, context)
     else:
         # Если пользователь ввёл что-то другое – повторяем предложение
         action_keyboard = [['🏠 Главное меню']]
         action_markup = ReplyKeyboardMarkup(action_keyboard, one_time_keyboard=False, resize_keyboard=True)
-        msg = await update.message.reply_text(
+        await send_and_track(update, context,
             "Пожалуйста, выбери действие с помощью кнопки:",
             reply_markup=action_markup
         )
-        bot_messages = context.user_data.get("bot_messages", [])
-        bot_messages.append(msg.message_id)
-        context.user_data["bot_messages"] = bot_messages
         return ACTION
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    await delete_messages(update, context)
+    await delete_bot_messages(update, context)
     await update.message.reply_text("Диалог прерван. Чтобы начать заново, отправь /start")
     return ConversationHandler.END
 
