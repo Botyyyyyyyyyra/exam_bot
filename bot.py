@@ -301,8 +301,13 @@ async def send_and_track(update: Update, context: ContextTypes.DEFAULT_TYPE, tex
 async def send_long_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, prefix: str = ""):
     MAX_LEN = 4096
     bot_messages = context.user_data.get("bot_messages", [])
+    # Сначала отправим префикс (заголовок) с Markdown, если он не пуст
+    if prefix:
+        prefix_msg = await update.message.reply_text(prefix, parse_mode="Markdown")
+        bot_messages.append(prefix_msg.message_id)
+    # Затем отправим основной текст без Markdown
     if len(text) <= MAX_LEN:
-        msg = await update.message.reply_text(f"{prefix}\n\n⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯\n\n{text}", parse_mode="Markdown")
+        msg = await update.message.reply_text(text)
         bot_messages.append(msg.message_id)
         context.user_data["bot_messages"] = bot_messages
         return
@@ -317,8 +322,8 @@ async def send_long_text(update: Update, context: ContextTypes.DEFAULT_TYPE, tex
     if current:
         parts.append(current)
     for i, part in enumerate(parts, 1):
-        header = f"{prefix} (часть {i}/{len(parts)})\n\n⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯\n\n" if len(parts) > 1 else f"{prefix}\n\n⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯\n\n"
-        msg = await update.message.reply_text(f"{header}{part}", parse_mode="Markdown")
+        header = f"(часть {i}/{len(parts)})\n\n⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯\n\n" if len(parts) > 1 else ""
+        msg = await update.message.reply_text(f"{header}{part}")
         bot_messages.append(msg.message_id)
     context.user_data["bot_messages"] = bot_messages
 
