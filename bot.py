@@ -73,12 +73,11 @@ async def debug_send(update: Update, text: str):
             pass
 
 async def send_long_text(update: Update, text: str, prefix: str = ""):
-    """Разбивает длинный текст на части и отправляет."""
+    """Разбивает длинный текст на части (Telegram лимит 4096 символов)."""
     MAX_LEN = 4096
     if len(text) <= MAX_LEN:
         await update.message.reply_text(f"{prefix}{text}", parse_mode="Markdown")
         return
-    # Разбиваем по предложениям или по границе слов
     parts = []
     current = ""
     for line in text.split('\n'):
@@ -94,19 +93,27 @@ async def send_long_text(update: Update, text: str, prefix: str = ""):
         await update.message.reply_text(f"{header}{part}", parse_mode="Markdown")
 
 async def download_image(session: aiohttp.ClientSession, url: str, referer: str) -> Optional[BytesIO]:
+    """Скачивает изображение и возвращает BytesIO с корректными данными."""
     headers = {
         "Referer": referer,
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
     }
     try:
-        async with session.get(url, timeout=10, headers=headers) as resp:
-            if resp.status == 200:
-                data = await resp.read()
-                if len(data) <= 10 * 1024 * 1024:
-                    return BytesIO(data)
-            return None
+        async with session.get(url, timeout=15, headers=headers) as resp:
+            if resp.status != 200:
+                logger.warning(f"Image download HTTP {resp.status} for {url}")
+                return None
+            data = await resp.read()
+            if not data:
+                logger.warning(f"Empty image data for {url}")
+                return None
+            if len(data) > 10 * 1024 * 1024:
+                logger.warning(f"Image too large: {len(data)} bytes for {url}")
+                return None
+            # Возвращаем BytesIO с копией данных
+            return BytesIO(data)
     except Exception as e:
-        logger.error(f"Image download error: {e}")
+        logger.error(f"Image download error for {url}: {e}")
         return None
 
 def extract_image_urls_from_soup(soup, base_url: str) -> list:
@@ -152,24 +159,28 @@ def format_html_to_text(html_content: str) -> str:
     return text.strip()
 
 async def send_image(update: Update, image_bytes: BytesIO) -> bool:
-    await debug_send(update, "send_image: начало")
-    image_bytes.seek(0)
-    header = image_bytes.read(10)
-    image_bytes.seek(0)
-    is_svg = (header.startswith(b'<svg') or b'<svg' in header)
-    if is_svg:
-        await update.message.reply_document(document=image_bytes, filename="image.svg")
-        await update.message.reply_text("⚠️ Изображение отправлено как файл (SVG).")
-        return False
+    """Отправляет изображение с максимальной надёжностью."""
     try:
-        await update.message.reply_photo(photo=image_bytes)
-        return True
-    except Exception as e:
-        logger.error(f"Photo send failed: {e}")
-        await debug_send(update, f"send_image: ошибка при отправке фото: {e}")
         image_bytes.seek(0)
-        await update.message.reply_document(document=image_bytes, filename="image.png")
-        await update.message.reply_text("⚠️ Изображение отправлено как файл.")
+        data = image_bytes.read()
+        if not data:
+            await debug_send(update, "send_image: пустое изображение")
+            return False
+        # Пытаемся отправить как фото
+        image_bytes.seek(0)
+        try:
+            await update.message.reply_photo(photo=image_bytes)
+            return True
+        except Exception as photo_err:
+            logger.warning(f"Photo send failed, trying as document: {photo_err}")
+            # Если не получилось как фото – отправляем как документ
+            image_bytes.seek(0)
+            await update.message.reply_document(document=image_bytes, filename="image.png")
+            await debug_send(update, "Изображение отправлено как документ")
+            return False
+    except Exception as e:
+        logger.error(f"send_image critical error: {e}")
+        await debug_send(update, f"Ошибка при отправке изображения: {e}")
         return False
 
 # ---------- Парсинг заданий ----------
@@ -334,7 +345,7 @@ async def level_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text("✍️ Введи свой ответ (только число/набор цифр без пробелов):")
         return WAITING_ANSWER
 
-    # ----- Русский язык (с разбивкой длинного текста) -----
+    # ----- Русский язык (с разбивкой длинного текста и надёжной отправкой изображений) -----
     elif subject == "Русский язык":
         if level_code != "ege":
             await update.message.reply_text("Для русского языка пока доступен только уровень ЕГЭ.")
@@ -358,14 +369,13 @@ async def level_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         user_id = update.effective_user.id
         user_tasks[user_id] = {"correct_answer": correct_answer}
 
-        # Отправка текста с разбивкой на части
+        # Отправка текста с разбивкой
         await debug_send(update, f"Начинаем отправку текста (длина {len(task['text'])} символов)")
         try:
             await send_long_text(update, task['text'], f"📖 *Задание {task_number} ({subject}, ЕГЭ)*\n\n")
             await debug_send(update, "Текст успешно отправлен")
         except Exception as e:
             await debug_send(update, f"Ошибка при отправке текста: {e}")
-            # fallback: отправить без Markdown, но с разбивкой
             await send_long_text(update, task['text'], f"Задание {task_number}\n\n")
 
         # Отправка изображений
