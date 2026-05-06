@@ -122,6 +122,35 @@ async def send_long_text(update: Update, context: ContextTypes.DEFAULT_TYPE, tex
         bot_messages.append(msg.message_id)
     context.user_data["bot_messages"] = bot_messages
 
+def clean_task_soup(soup):
+    """Удаляет из супа все элементы, которые не относятся к самому заданию (условию)."""
+    # 1. Удаляем элементы, скрытые через style="display:none"
+    for elem in soup.find_all(attrs={"style": re.compile(r"display:\s*none", re.I)}):
+        elem.decompose()
+    # 2. Удаляем элементы с классами, которые обычно содержат пояснения/правила
+    classes_to_remove = ["align-left", "nocopy", "expand", "nodraw", "minor", 
+                         "Test-TimerBox", "right_switch", "skipped_probs", "DeskList", 
+                         "prob_nums", "new_header", "col_name", "wrap_flex_table", "wrap_flex_table_col"]
+    for cls in classes_to_remove:
+        for elem in soup.find_all(class_=cls):
+            elem.decompose()
+    # 3. Удаляем теги details (в них прячут правила и пояснения)
+    for details in soup.find_all("details"):
+        details.decompose()
+    # 4. Удаляем блоки с правилами (часто имеют класс "rus_rule" или находятся внутри div с border)
+    for rule in soup.find_all("div", class_=re.compile(r"rus_rule|handbook|example|prob_view")):
+        # Не удаляем сам pbody, который является родительским
+        if rule.get("class") and "prob_view" not in rule.get("class", []):
+            rule.decompose()
+    # 5. Удаляем любые iframe, скрипты, стили, формы
+    for tag in soup(["script", "style", "iframe", "form", "input", "button", "select", "textarea"]):
+        tag.decompose()
+    # 6. Удаляем пустые элементы
+    for elem in soup.find_all():
+        if not elem.get_text(strip=True) and not elem.find_all(recursive=False):
+            elem.decompose()
+    return soup
+
 def get_image_extension(data: bytes) -> str:
     if data[:4] == b'\x89PNG':
         return '.png'
@@ -184,7 +213,11 @@ def extract_image_urls_from_soup(soup, base_url: str) -> list:
     return urls
 
 def get_first_subquestion_html(pbody_html: str) -> str:
-    patterns = [r'<center><p><b>ИЛИ</b>', r'<b>ИЛИ</b>', r'<p><b>ИЛИ</b>']
+    patterns = [
+        r'<center><p><b>ИЛИ</b>',
+        r'<b>ИЛИ</b>',
+        r'<p><b>ИЛИ</b>',
+    ]
     for pattern in patterns:
         match = re.search(pattern, pbody_html, re.IGNORECASE)
         if match:
@@ -231,7 +264,9 @@ async def fetch_math_task(test_url: str, task_number: int, update: Update) -> Op
                 pbody = prob_view.find("div", class_="pbody")
                 if not pbody:
                     return None
-                original_html = str(pbody)
+                # Очистка от лишних элементов
+                cleaned_pbody = clean_task_soup(pbody)
+                original_html = str(cleaned_pbody)
                 first_html = get_first_subquestion_html(original_html)
                 first_soup = BeautifulSoup(first_html, "html.parser")
                 img_urls = extract_image_urls_from_soup(first_soup, test_url)
@@ -247,10 +282,12 @@ async def fetch_math_task(test_url: str, task_number: int, update: Update) -> Op
             return None
 
 async def fetch_russian_task(test_url: str, task_number: int, update: Update) -> Optional[Dict]:
+    await debug_send(update, f"fetch_russian_task: начало загрузки задания №{task_number}")
     async with aiohttp.ClientSession() as session:
         try:
             async with session.get(test_url, timeout=15, headers={"User-Agent": "Mozilla/5.0"}) as resp:
                 if resp.status != 200:
+                    await debug_send(update, f"Ошибка HTTP {resp.status}")
                     return None
                 html = await resp.text()
                 soup = BeautifulSoup(html, "html.parser")
@@ -260,33 +297,39 @@ async def fetch_russian_task(test_url: str, task_number: int, update: Update) ->
                         prob_num_div = div
                         break
                 if not prob_num_div:
+                    await debug_send(update, f"Не найден номер {task_number}")
                     return None
                 prob_view = prob_num_div.find_next_sibling("div", class_="prob_view")
                 if not prob_view:
+                    await debug_send(update, "Не найден prob_view")
                     return None
                 pbody = prob_view.find("div", class_="pbody")
                 if not pbody:
+                    await debug_send(update, "Не найден pbody")
                     return None
-                original_html = str(pbody)
+                # Очистка от лишних элементов
+                cleaned_pbody = clean_task_soup(pbody)
+                original_html = str(cleaned_pbody)
                 first_html = get_first_subquestion_html(original_html)
                 first_soup = BeautifulSoup(first_html, "html.parser")
                 img_urls = extract_image_urls_from_soup(first_soup, test_url)
+                await debug_send(update, f"Найдено URL изображений: {len(img_urls)} (после очистки)")
                 images_io = []
                 for url in img_urls:
                     img_data = await download_image(session, url, referer=test_url)
                     if img_data:
                         images_io.append(img_data)
                 task_text = format_html_to_text(first_html)
+                await debug_send(update, f"Русский: текст получен, изображений: {len(images_io)} из {len(img_urls)}")
                 return {"text": task_text, "images": images_io}
         except Exception as e:
             logger.error(f"Russian error: {e}")
+            await debug_send(update, f"Исключение в fetch_russian_task: {e}")
             return None
 
 # ---------- Обработчики диалога ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    # Удаляем все предыдущие сообщения бота
     await delete_bot_messages(update, context)
-    # Удаляем сообщение пользователя, если это не команда /start
     await delete_user_message(update, context)
     reply_keyboard = [[subject] for subject in SUBJECTS.keys()]
     msg = await update.message.reply_text(
@@ -300,7 +343,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return SUBJECT
 
 async def subject_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    # Удаляем сообщение пользователя с выбором предмета
     await delete_user_message(update, context)
     text = update.message.text
     if text == '🏠 Главное меню':
@@ -308,7 +350,13 @@ async def subject_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return await start(update, context)
 
     if text not in SUBJECTS:
-        await send_and_track(update, context, "Пожалуйста, выбери предмет из списка.", reply_markup=ReplyKeyboardMarkup([[s] for s in SUBJECTS.keys()], one_time_keyboard=True))
+        msg = await update.message.reply_text(
+            "Пожалуйста, выбери предмет из списка.",
+            reply_markup=ReplyKeyboardMarkup([[s] for s in SUBJECTS.keys()], one_time_keyboard=True)
+        )
+        bot_messages = context.user_data.get("bot_messages", [])
+        bot_messages.append(msg.message_id)
+        context.user_data["bot_messages"] = bot_messages
         return SUBJECT
     context.user_data["subject"] = text
     reply_keyboard = [[level] for level in LEVELS.keys()]
@@ -322,7 +370,6 @@ async def subject_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     return LEVEL
 
 async def level_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    # Удаляем сообщение пользователя с выбором уровня
     await delete_user_message(update, context)
     level_name = update.message.text
     if level_name == '🏠 Главное меню':
@@ -330,7 +377,13 @@ async def level_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return await start(update, context)
 
     if level_name not in LEVELS:
-        await send_and_track(update, context, "Пожалуйста, выбери уровень из списка.", reply_markup=ReplyKeyboardMarkup([[l] for l in LEVELS.keys()], one_time_keyboard=True))
+        msg = await update.message.reply_text(
+            "Пожалуйста, выбери уровень из списка.",
+            reply_markup=ReplyKeyboardMarkup([[l] for l in LEVELS.keys()], one_time_keyboard=True)
+        )
+        bot_messages = context.user_data.get("bot_messages", [])
+        bot_messages.append(msg.message_id)
+        context.user_data["bot_messages"] = bot_messages
         return LEVEL
 
     subject = context.user_data.get("subject")
@@ -368,6 +421,7 @@ async def level_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await send_and_track(update, context, "📎 Пояснение к заданию (изображения ниже):")
             for img_io in task["images"]:
                 await send_image(update, context, img_io)
+
         await send_and_track(update, context, "✍️ Введи свой ответ (только число/набор цифр без пробелов):")
         return WAITING_ANSWER
 
@@ -399,6 +453,7 @@ async def level_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await send_and_track(update, context, "📎 Пояснение к заданию (изображения ниже):")
             for img_io in task["images"]:
                 await send_image(update, context, img_io)
+
         await send_and_track(update, context, "✍️ Введи свой ответ (слово, число или последовательность цифр без пробелов):")
         return WAITING_ANSWER
 
@@ -439,7 +494,6 @@ async def check_answer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     return ACTION
 
 async def action_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    # Удаляем сообщение пользователя с нажатием кнопки
     await delete_user_message(update, context)
     text = update.message.text
     if text == '🏠 Главное меню':
